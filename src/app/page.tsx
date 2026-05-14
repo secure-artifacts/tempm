@@ -863,6 +863,9 @@ export default function Home() {
           <h1 className="text-lg font-semibold mb-4" style={{ color: "var(--primary)" }}>☁️ Number One</h1>
           <input
             type="password"
+            autoComplete="off"
+            data-lpignore="true"
+            data-1p-ignore="true"
             placeholder="访问密码"
             value={tokenInput}
             onChange={e => setTokenInput(e.target.value)}

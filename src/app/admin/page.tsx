@@ -272,6 +272,9 @@ export default function AdminPage() {
           </h1>
           <input
             type="password"
+            autoComplete="off"
+            data-lpignore="true"
+            data-1p-ignore="true"
             placeholder="输入管理密码"
             value={password}
             onChange={(e) => setPassword(e.target.value)}

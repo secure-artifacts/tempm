@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS passwords (
   label TEXT DEFAULT '',
   confirmed INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  last_link_received_at INTEGER
 );
 
 -- Auto cleanup: delete emails older than configured hours

@@ -131,13 +131,23 @@ async function checkAuthFull(request: Request, env: Env): Promise<boolean> {
   if (checkAuth(request, env)) return true;
   const auth = request.headers.get("Authorization") || "";
   if (!auth.startsWith("Bearer ")) return false;
-  const password = auth.slice(7);
+  return await checkPassword(auth.slice(7), env);
+}
+
+async function checkPassword(password: string, env: Env): Promise<boolean> {
+  if (password === env.ADMIN_PASSWORD) return true;
   const storedHash = await getConfig(env.DB, "site_password_hash");
   if (!storedHash) return false;
   const data = new TextEncoder().encode(password);
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, "0")).join("");
   return hashHex === storedHash;
+}
+
+async function checkAuthFullOrQueryToken(request: Request, env: Env, url: URL): Promise<boolean> {
+  if (await checkAuthFull(request, env)) return true;
+  const token = url.searchParams.get("token") || "";
+  return token ? await checkPassword(token, env) : false;
 }
 
 
@@ -298,6 +308,9 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 
   // GET /api/emails?address=xxx@domain.com
   if (url.pathname === "/api/emails" && request.method === "GET") {
+    if (!await checkAuthFull(request, env)) {
+      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    }
     const address = (url.searchParams.get("address") || "").toLowerCase();
     if (!address) {
       return Response.json({ error: "address required" }, { status: 400, headers });
@@ -473,6 +486,9 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 
   // GET /api/tag-emails?tag=ck — metadata + activation link (supports both new label-based and old dash-tag format)
   if (url.pathname === "/api/tag-emails" && request.method === "GET") {
+    if (!await checkAuthFull(request, env)) {
+      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    }
     const tag = (url.searchParams.get("tag") || "").toLowerCase();
     if (!tag) return Response.json({ error: "tag required" }, { status: 400, headers });
 
@@ -512,8 +528,40 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return Response.json({ emails }, { headers });
   }
 
+  // GET /api/all-emails — metadata + activation link for all received emails
+  if (url.pathname === "/api/all-emails" && request.method === "GET") {
+    if (!await checkAuthFull(request, env)) {
+      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    }
+
+    const rows = await env.DB.prepare(
+      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails ORDER BY timestamp DESC LIMIT 200"
+    ).all();
+
+    const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
+    const emails = ((rows.results || []) as Record<string, unknown>[]).map((row) => {
+      const content = ((row.html_body as string) || "") + " " + ((row.text_body as string) || "");
+      let activationLink: string | null = null;
+      if (linkFilter) {
+        const re = /https?:\/\/[^\s"'<>)]+/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(content)) !== null) {
+          if (m[0].includes(linkFilter)) { activationLink = m[0].replace(/[.,;!?]+$/, ""); break; }
+        }
+      }
+      return {
+        id: row.id, to: row.to, from: row.from, subject: row.subject, timestamp: row.timestamp,
+        activationLink,
+      };
+    });
+    return Response.json({ emails }, { headers });
+  }
+
   // GET /api/email-detail?id=xxx — full email content (html + text) on demand
   if (url.pathname === "/api/email-detail" && request.method === "GET") {
+    if (!await checkAuthFull(request, env)) {
+      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    }
     const id = url.searchParams.get("id") || "";
     if (!id) return Response.json({ error: "id required" }, { status: 400, headers });
     const row = await env.DB.prepare(
@@ -619,6 +667,9 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 
   // GET /api/stream?tag=xxx&since=timestamp — SSE push for new emails
   if (url.pathname === "/api/stream" && request.method === "GET") {
+    if (!await checkAuthFullOrQueryToken(request, env, url)) {
+      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    }
     const tag = (url.searchParams.get("tag") || "").toLowerCase();
     if (!tag) return Response.json({ error: "tag required" }, { status: 400, headers });
 

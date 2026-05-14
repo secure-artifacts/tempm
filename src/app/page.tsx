@@ -269,7 +269,7 @@ function GenerateEmailPanel({ tag, allDomains, adminToken, sseDisabled }: { tag:
 }
 
 // ── EmailPanel (single address inbox) ──────────────────────────────────────
-function EmailPanel({ address, onClose }: { address: string; onClose: () => void }) {
+function EmailPanel({ address, adminToken, onClose }: { address: string; adminToken: string; onClose: () => void }) {
   const [emails, setEmails] = useState<Email[]>([]);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -285,7 +285,9 @@ function EmailPanel({ address, onClose }: { address: string; onClose: () => void
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${WORKER_URL}/api/emails?address=${encodeURIComponent(address)}`);
+      const res = await fetch(`${WORKER_URL}/api/emails?address=${encodeURIComponent(address)}`, {
+        headers: { "Authorization": `Bearer ${adminToken}` },
+      });
       if (res.ok) {
         const d = await res.json();
         const list = d.emails || [];
@@ -293,7 +295,7 @@ function EmailPanel({ address, onClose }: { address: string; onClose: () => void
         if (list.length > 0) setExpanded(list[0].id);
       }
     } finally { setLoading(false); }
-  }, [address]);
+  }, [address, adminToken]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -389,7 +391,7 @@ interface TagEmailMeta { id: string; to: string; from: string; subject: string; 
 
 type ConnState = "connecting" | "connected" | "reconnecting" | "sleeping";
 
-function TagEmailsPanel({ tag, onConnStateChange }: { tag: string; onConnStateChange?: (state: ConnState) => void }) {
+function TagEmailsPanel({ tag, adminToken, allMode = false, onConnStateChange }: { tag: string; adminToken: string; allMode?: boolean; onConnStateChange?: (state: ConnState) => void }) {
   const [allEmails, setAllEmails] = useState<TagEmailMeta[]>([]);
   const [connState, setConnState] = useState<ConnState>("connecting");
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -478,18 +480,30 @@ function TagEmailsPanel({ tag, onConnStateChange }: { tag: string; onConnStateCh
     if (emailDetail[id]) return;
     setDetailLoading(id);
     try {
-      const res = await fetch(`${WORKER_URL}/api/email-detail?id=${encodeURIComponent(id)}`);
+      const res = await fetch(`${WORKER_URL}/api/email-detail?id=${encodeURIComponent(id)}`, {
+        headers: { "Authorization": `Bearer ${adminToken}` },
+      });
       if (!res.ok) return;
       const d = await res.json() as { email: { html: string; text: string } };
       setEmailDetail(prev => ({ ...prev, [id]: { html: d.email.html || "", text: d.email.text || "" } }));
     } finally { setDetailLoading(null); }
-  }, [emailDetail]);
+  }, [adminToken, emailDetail]);
+
+  const fetchEmailList = useCallback(async () => {
+    const url = allMode
+      ? `${WORKER_URL}/api/all-emails`
+      : `${WORKER_URL}/api/tag-emails?tag=${encodeURIComponent(tag)}`;
+    const init: RequestInit = { cache: "no-store" };
+    init.headers = { "Authorization": `Bearer ${adminToken}` };
+    const res = await fetch(url, init);
+    if (!res.ok) return null;
+    return await res.json() as { emails: Array<{ id: string; to: string; from: string; subject: string; timestamp: number; activationLink: string | null }> };
+  }, [adminToken, allMode, tag]);
 
   const manualRefresh = useCallback(async () => {
     try {
-      const res = await fetch(`${WORKER_URL}/api/tag-emails?tag=${encodeURIComponent(tag)}`, { cache: "no-store" });
-      if (!res.ok) return;
-      const d = await res.json() as { emails: Array<{ id: string; to: string; from: string; subject: string; timestamp: number; activationLink: string | null }> };
+      const d = await fetchEmailList();
+      if (!d) return;
       const emails = (d.emails || []).map(e => ({ ...e, toAddress: e.to }));
       setAllEmails(emails);
       setLastUpdated(new Date());
@@ -498,7 +512,7 @@ function TagEmailsPanel({ tag, onConnStateChange }: { tag: string; onConnStateCh
         if (maxTs > lastTsRef.current) lastTsRef.current = maxTs;
       }
     } catch {}
-  }, [tag]);
+  }, [fetchEmailList]);
 
   // SSE setup: initial fetch to get existing emails, then persistent push connection
   // wakeTrigger increments on manual wake-up to re-run this effect
@@ -506,9 +520,25 @@ function TagEmailsPanel({ tag, onConnStateChange }: { tag: string; onConnStateCh
     cancelledRef.current = false;
     lastTsRef.current = Date.now();
 
+    if (allMode) {
+      fetchEmailList()
+        .then((d) => {
+          if (cancelledRef.current || !d) return;
+          const emails = (d.emails || []).map(e => ({ ...e, toAddress: e.to }));
+          setAllEmails(emails);
+          setLastUpdated(new Date());
+          setConnState("connected");
+        })
+        .catch(() => { if (!cancelledRef.current) setConnState("connected"); });
+
+      return () => {
+        cancelledRef.current = true;
+      };
+    }
+
     const connect = () => {
       if (cancelledRef.current) return;
-      const es = new EventSource(`${WORKER_URL}/api/stream?tag=${encodeURIComponent(tag)}&since=${lastTsRef.current}`);
+      const es = new EventSource(`${WORKER_URL}/api/stream?tag=${encodeURIComponent(tag)}&since=${lastTsRef.current}&token=${encodeURIComponent(adminToken)}`);
       esRef.current = es;
 
       es.onopen = () => {
@@ -539,10 +569,10 @@ function TagEmailsPanel({ tag, onConnStateChange }: { tag: string; onConnStateCh
       };
     };
 
-    fetch(`${WORKER_URL}/api/tag-emails?tag=${encodeURIComponent(tag)}`, { cache: "no-store" })
-      .then(r => r.json())
-      .then((d: { emails: Array<{ id: string; to: string; from: string; subject: string; timestamp: number; activationLink: string | null }> }) => {
+    fetchEmailList()
+      .then((d) => {
         if (cancelledRef.current) return;
+        if (!d) return;
         const emails = (d.emails || []).map(e => ({ ...e, toAddress: e.to }));
         setAllEmails(emails);
         setLastUpdated(new Date());
@@ -557,7 +587,7 @@ function TagEmailsPanel({ tag, onConnStateChange }: { tag: string; onConnStateCh
       esRef.current = null;
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     };
-  }, [tag, wakeTrigger]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [allMode, fetchEmailList, tag, wakeTrigger]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="card mb-6" style={{ borderLeft: "3px solid var(--primary)" }}>
@@ -577,13 +607,15 @@ function TagEmailsPanel({ tag, onConnStateChange }: { tag: string; onConnStateCh
 
       <div className="flex items-center justify-between cursor-pointer" onClick={() => setOpen(o => !o)}>
         <span className="font-semibold text-sm" style={{ color: "var(--primary)" }}>
-          📨 -{tag} 全部收件
+          📨 {allMode ? "全部收件" : `-${tag} 全部收件`}
           {allEmails.length > 0 && open && <span className="badge ml-1">{allEmails.length}</span>}
         </span>
         <div className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
           {open && (
             <>
-              {connState === "connected"
+              {allMode
+                ? <span style={{ color: "#22c55e", fontSize: 10 }}>● 已加载</span>
+                : connState === "connected"
                 ? <span style={{ color: "#22c55e", fontSize: 10 }}>● 实时监听中</span>
                 : connState === "sleeping"
                 ? <span style={{ color: "#f59e0b", fontSize: 10 }}>😴 已休眠</span>
@@ -607,7 +639,7 @@ function TagEmailsPanel({ tag, onConnStateChange }: { tag: string; onConnStateCh
             <p className="text-center text-gray-400 py-4 text-sm">
               {connState === "connecting" ? "连接中..."
                 : connState === "sleeping" ? "已休眠，点击唤醒后继续接收"
-                : "暂无邮件，实时等待中..."}
+                : allMode ? "暂无邮件" : "暂无邮件，实时等待中..."}
             </p>
           )}
 
@@ -876,11 +908,14 @@ export default function Home() {
           ))}
         </div>
 
-        {/* Per-tag panels (non-"all" tabs only) */}
+        {/* Inbox panels */}
+        {activeTag === "all" && (
+          <TagEmailsPanel key="inbox-all" tag="all" adminToken={adminToken} allMode />
+        )}
         {activeTag !== "all" && (
           <>
             <GenerateEmailPanel key={`gen-${activeTag}`} tag={activeTag} allDomains={allDomains} adminToken={adminToken} sseDisabled={sseState !== "connected"} />
-            <TagEmailsPanel key={`inbox-${activeTag}`} tag={activeTag} onConnStateChange={setSseState} />
+            <TagEmailsPanel key={`inbox-${activeTag}`} tag={activeTag} adminToken={adminToken} onConnStateChange={setSseState} />
           </>
         )}
 
@@ -984,7 +1019,7 @@ export default function Home() {
 
               {/* Inbox panel */}
               {expanded[entry.address] && (
-                <EmailPanel address={entry.address}
+                <EmailPanel address={entry.address} adminToken={adminToken}
                   onClose={() => setExpanded((p) => ({ ...p, [entry.address]: false }))} />
               )}
             </div>

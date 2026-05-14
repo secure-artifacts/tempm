@@ -59,17 +59,26 @@ function corsHeaders(request: Request, env: Env): Record<string, string> {
   };
 }
 
-async function streamToText(stream: ReadableStream | null): Promise<string> {
+async function streamToText(stream: ReadableStream | null, maxChars = MAX_RAW_EMAIL_CHARS): Promise<string> {
   if (!stream) return "";
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let result = "";
+  let truncated = false;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    result += decoder.decode(value, { stream: true });
+    const chunk = decoder.decode(value, { stream: true });
+    if (result.length + chunk.length > maxChars) {
+      result += chunk.slice(0, Math.max(0, maxChars - result.length));
+      truncated = true;
+      try { await reader.cancel("message too large"); } catch {}
+      break;
+    }
+    result += chunk;
   }
-  return result;
+  if (!truncated) result += decoder.decode();
+  return truncated ? `${result}\n\n[truncated]` : result;
 }
 
 // ========== D1 Config Helpers ==========
@@ -177,6 +186,11 @@ function getLastEasternReset(): number {
 }
 
 const TAG_DAILY_LIMIT = 30;
+const MAX_RAW_EMAIL_CHARS = 256 * 1024;
+const MAX_STORED_BODY_CHARS = 128 * 1024;
+const MAX_STORED_SUBJECT_CHARS = 500;
+const STREAM_POLL_MS = 15_000;
+const EMAIL_LIST_LIMIT = 200;
 
 // ========== Email parsing ==========
 
@@ -186,6 +200,11 @@ function decodeQP(str: string): string {
     .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) =>
       String.fromCharCode(parseInt(hex, 16))
     );
+}
+
+function truncateText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n\n[truncated]`;
 }
 
 function parseEmailContent(rawEmail: string) {
@@ -254,7 +273,11 @@ function parseEmailContent(rawEmail: string) {
     }
   }
 
-  return { subject, textBody, htmlBody };
+  return {
+    subject: truncateText(subject, MAX_STORED_SUBJECT_CHARS),
+    textBody: truncateText(textBody, MAX_STORED_BODY_CHARS),
+    htmlBody: truncateText(htmlBody, MAX_STORED_BODY_CHARS),
+  };
 }
 
 // ========== HTTP Request Handler ==========
@@ -494,20 +517,20 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 
     // New format: address has no tag, tag stored in passwords.label
     const newRows = await env.DB.prepare(
-      "SELECT e.id, e.mail_to as 'to', e.mail_from as 'from', e.subject, e.text_body, e.html_body, e.timestamp FROM emails e INNER JOIN passwords p ON p.address = e.mail_to WHERE p.label = ? ORDER BY e.timestamp DESC LIMIT 200"
-    ).bind(tag).all();
+      "SELECT e.id, e.mail_to as 'to', e.mail_from as 'from', e.subject, e.text_body, e.html_body, e.timestamp FROM emails e INNER JOIN passwords p ON p.address = e.mail_to WHERE p.label = ? ORDER BY e.timestamp DESC LIMIT ?"
+    ).bind(tag, EMAIL_LIST_LIMIT).all();
 
     // Old format: tag embedded in address as -tag@ (backwards compat)
     const oldRows = await env.DB.prepare(
-      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails WHERE mail_to LIKE ? ORDER BY timestamp DESC LIMIT 200"
-    ).bind(`%-${tag}@%`).all();
+      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails WHERE mail_to LIKE ? ORDER BY timestamp DESC LIMIT ?"
+    ).bind(`%-${tag}@%`, EMAIL_LIST_LIMIT).all();
 
     // Merge, deduplicate by id, sort by timestamp desc
     const seen = new Set<unknown>();
     const merged = [...(newRows.results || []), ...(oldRows.results || [])]
       .filter(r => { if (seen.has((r as Record<string, unknown>).id)) return false; seen.add((r as Record<string, unknown>).id); return true; })
       .sort((a, b) => ((b as Record<string, unknown>).timestamp as number) - ((a as Record<string, unknown>).timestamp as number))
-      .slice(0, 200);
+      .slice(0, EMAIL_LIST_LIMIT);
 
     const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
     const emails = merged.map((row: Record<string, unknown>) => {
@@ -535,8 +558,8 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     }
 
     const rows = await env.DB.prepare(
-      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails ORDER BY timestamp DESC LIMIT 200"
-    ).all();
+      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails ORDER BY timestamp DESC LIMIT ?"
+    ).bind(EMAIL_LIST_LIMIT).all();
 
     const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
     const emails = ((rows.results || []) as Record<string, unknown>[]).map((row) => {
@@ -693,14 +716,14 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
         const linkFilter = await getConfig(env.DB, "link_filter");
 
         while (!closed) {
-          await new Promise<void>(r => setTimeout(r, 10000));
+          await new Promise<void>(r => setTimeout(r, STREAM_POLL_MS));
           if (closed) break;
 
           try {
             const rows = await env.DB.prepare(
               "SELECT e.id, e.mail_to as 'to', e.mail_from as 'from', e.subject, e.html_body, e.text_body, e.timestamp " +
               "FROM emails e INNER JOIN passwords p ON p.address = e.mail_to " +
-              "WHERE p.label = ? AND e.timestamp > ? ORDER BY e.timestamp ASC LIMIT 20"
+              "WHERE p.label = ? AND e.timestamp > ? ORDER BY e.timestamp ASC LIMIT 10"
             ).bind(tag, lastTs).all();
 
             for (const row of (rows.results || []) as Record<string, unknown>[]) {
@@ -744,10 +767,12 @@ export default {
     const to = message.to.toLowerCase();
     const [localPart, domain] = to.split("@");
 
-    const domains = await getDomains(env.DB);
-    const domainsPool2 = await getDomainsPool2(env.DB);
-    const forwardRules = await getForwardRules(env.DB);
-    const tagRules = await getTagRules(env.DB);
+    const [domains, domainsPool2, forwardRules, tagRules] = await Promise.all([
+      getDomains(env.DB),
+      getDomainsPool2(env.DB),
+      getForwardRules(env.DB),
+      getTagRules(env.DB),
+    ]);
 
     const knownTags = tagRules.map((r) => r.tag.toLowerCase());
 

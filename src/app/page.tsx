@@ -151,22 +151,34 @@ function GenerateEmailPanel({ tag, allDomains, adminToken, sseDisabled }: { tag:
       showToast(anyDailyLeft ? "⚠️ 本小时配额已满（每域名每小时最多5个）" : "⚠️ 所选域名今日配额已满");
       return;
     }
-    const picked = available[Math.floor(Math.random() * available.length)];
-    const addr = `${generateNamePrefix()}@${picked}`;
-    setGenerated(addr);
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const picked = available[Math.floor(Math.random() * available.length)];
+      const addr = `${generateNamePrefix()}@${picked}`;
 
-    // Pre-save to DB as unconfirmed (confirmed=0) so worker knows the tag when email arrives.
-    // Quota is NOT consumed here — only when the first email arrives.
-    try {
-      await fetch(`${WORKER_URL}/api/passwords`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${adminToken}` },
-        body: JSON.stringify({ address: addr, password: generatePassword(), label: tag }),
-      });
-      loadDomainQuotas(allDomains);
-    } catch { /* ignore */ }
+      // Pre-save to DB as unconfirmed (confirmed=0) so worker knows the tag when email arrives.
+      // Quota is NOT consumed here — only when the first email arrives.
+      try {
+        const res = await fetch(`${WORKER_URL}/api/passwords`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${adminToken}` },
+          body: JSON.stringify({ address: addr, password: generatePassword(), label: tag }),
+        });
+        if (res.status === 409) continue;
+        if (!res.ok) {
+          showToast("❌ 生成失败，请重试");
+          return;
+        }
+        setGenerated(addr);
+        loadDomainQuotas(allDomains);
+        copy(addr);
+        return;
+      } catch {
+        showToast("❌ 生成失败，请检查网络");
+        return;
+      }
+    }
 
-    copy(addr);
+    showToast("⚠️ 邮箱名重复，请再试一次");
   };
 
   const allDomainsFull = quotasLoaded && allDomains.length > 0 && allDomains

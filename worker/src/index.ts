@@ -534,11 +534,10 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     }
     const now = Date.now();
     // Save as unconfirmed (confirmed=0); quota is checked and consumed only when email arrives
-    const addrLc = body.address.toLowerCase();
-    const addrDomain = addrLc.includes("@") ? addrLc.slice(addrLc.indexOf("@") + 1) : "";
+    const addrDomain = address.includes("@") ? address.slice(address.indexOf("@") + 1) : "";
     await env.DB.prepare(
-      "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain) VALUES (?, ?, ?, 0, ?, ?, ?) ON CONFLICT(address) DO UPDATE SET password=excluded.password, label=excluded.label, updated_at=excluded.updated_at, domain=excluded.domain"
-    ).bind(addrLc, body.password, body.label || "", now, now, addrDomain).run();
+      "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain) VALUES (?, ?, ?, 0, ?, ?, ?)"
+    ).bind(address, body.password, body.label || "", now, now, addrDomain).run();
     return Response.json({ ok: true }, { headers });
   }
 

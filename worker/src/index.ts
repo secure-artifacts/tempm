@@ -211,7 +211,7 @@ const MAX_RAW_EMAIL_CHARS = 256 * 1024;
 const MAX_STORED_BODY_CHARS = 128 * 1024;
 const MAX_STORED_SUBJECT_CHARS = 500;
 const STREAM_POLL_MS = 30_000;
-const EMAIL_LIST_LIMIT = 200;
+const EMAIL_LIST_LIMIT = 40;
 
 
 // ========== Email parsing ==========

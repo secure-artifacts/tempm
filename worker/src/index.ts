@@ -579,22 +579,11 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const tag = (url.searchParams.get("tag") || "").toLowerCase();
     if (!tag) return Response.json({ error: "tag required" }, { status: 400, headers });
 
-    // New format: address has no tag, tag stored in passwords.label
-    const newRows = await env.DB.prepare(
-      "SELECT e.id, e.mail_to as 'to', e.mail_from as 'from', e.subject, e.text_body, e.html_body, e.timestamp FROM emails e INNER JOIN passwords p ON p.address = e.mail_to WHERE p.label = ? ORDER BY e.timestamp DESC LIMIT ?"
+    // Tag denormalized onto emails.label — single indexed lookup (idx_emails_label_ts)
+    const rows = await env.DB.prepare(
+      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails WHERE label = ? ORDER BY timestamp DESC LIMIT ?"
     ).bind(tag, EMAIL_LIST_LIMIT).all();
-
-    // Old format: tag embedded in address as -tag@ (backwards compat)
-    const oldRows = await env.DB.prepare(
-      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails WHERE mail_to LIKE ? ORDER BY timestamp DESC LIMIT ?"
-    ).bind(`%-${tag}@%`, EMAIL_LIST_LIMIT).all();
-
-    // Merge, deduplicate by id, sort by timestamp desc
-    const seen = new Set<unknown>();
-    const merged = [...(newRows.results || []), ...(oldRows.results || [])]
-      .filter(r => { if (seen.has((r as Record<string, unknown>).id)) return false; seen.add((r as Record<string, unknown>).id); return true; })
-      .sort((a, b) => ((b as Record<string, unknown>).timestamp as number) - ((a as Record<string, unknown>).timestamp as number))
-      .slice(0, EMAIL_LIST_LIMIT);
+    const merged = (rows.results || []) as Record<string, unknown>[];
 
     const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
     const emails = merged.map((row: Record<string, unknown>) => {
@@ -892,9 +881,8 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 
           try {
             const rows = await env.DB.prepare(
-              "SELECT e.id, e.mail_to as 'to', e.mail_from as 'from', e.subject, e.html_body, e.text_body, e.timestamp " +
-              "FROM emails e INNER JOIN passwords p ON p.address = e.mail_to " +
-              "WHERE p.label = ? AND e.timestamp > ? ORDER BY e.timestamp ASC LIMIT 10"
+              "SELECT id, mail_to as 'to', mail_from as 'from', subject, html_body, text_body, timestamp " +
+              "FROM emails WHERE label = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT 10"
             ).bind(tag, lastTs).all();
 
             for (const row of (rows.results || []) as Record<string, unknown>[]) {
@@ -1060,8 +1048,8 @@ export default {
 
     // Save email to inbox
     await env.DB.prepare(
-      "INSERT INTO emails (id, mail_to, mail_from, subject, text_body, html_body, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).bind(generateId(), accountAddress, message.from, subject, textBody, htmlBody, now).run();
+      "INSERT INTO emails (id, mail_to, mail_from, subject, text_body, html_body, timestamp, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(generateId(), accountAddress, message.from, subject, textBody, htmlBody, now, tag).run();
 
     // Update last_link_received_at if email contains a link matching linkFilter
     const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";

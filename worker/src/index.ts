@@ -117,16 +117,25 @@ async function getTagRules(db: D1Database): Promise<TagRule[]> {
 }
 
 async function getLimits(db: D1Database) {
-  const [t, d, h] = await Promise.all([
+  const [t, d, h, l] = await Promise.all([
     getConfig(db, "tag_daily_limit"),
     getConfig(db, "domain_daily_limit"),
     getConfig(db, "domain_hourly_limit"),
+    getConfig(db, "domain_lifetime_limit"),
   ]);
   return {
     tagDaily: parseInt(t) || 30,
     domainDaily: parseInt(d) || 20,
     domainHourly: parseInt(h) || 5,
+    domainLifetime: parseInt(l) || 500,
   };
+}
+
+async function getDomainLifetimeUsed(db: D1Database, domain: string): Promise<number> {
+  const row = await db.prepare(
+    "SELECT COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain = ?"
+  ).bind(domain).first() as { count: number } | null;
+  return row?.count || 0;
 }
 
 // Parse -tag suffix from email local part using last dash segment
@@ -201,7 +210,7 @@ function getLastEasternReset(): number {
 const MAX_RAW_EMAIL_CHARS = 256 * 1024;
 const MAX_STORED_BODY_CHARS = 128 * 1024;
 const MAX_STORED_SUBJECT_CHARS = 500;
-const STREAM_POLL_MS = 15_000;
+const STREAM_POLL_MS = 30_000;
 const EMAIL_LIST_LIMIT = 200;
 
 
@@ -391,7 +400,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
       const domainsPool2 = await getDomainsPool2(env.DB);
       const forwardRules = await getForwardRules(env.DB);
       const tagRules = await getTagRules(env.DB);
-      const { tagDaily, domainDaily, domainHourly } = await getLimits(env.DB);
+      const { tagDaily, domainDaily, domainHourly, domainLifetime } = await getLimits(env.DB);
       const siteName = await getConfig(env.DB, "site_name");
       const autoDeleteHours = await getConfig(env.DB, "auto_delete_hours");
       const linkFilter = await getConfig(env.DB, "link_filter");
@@ -405,6 +414,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
         tagDailyLimit: tagDaily,
         domainDailyLimit: domainDaily,
         domainHourlyLimit: domainHourly,
+        domainLifetimeLimit: domainLifetime,
       }, { headers });
     }
 
@@ -424,6 +434,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
         tagDailyLimit?: number;
         domainDailyLimit?: number;
         domainHourlyLimit?: number;
+        domainLifetimeLimit?: number;
       };
       if (body.domains !== undefined) await setConfig(env.DB, "domains", JSON.stringify(body.domains));
       if (body.domainsPool2 !== undefined) await setConfig(env.DB, "domains_pool2", JSON.stringify(body.domainsPool2));
@@ -446,6 +457,11 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
         const v = parseInt(String(body.domainHourlyLimit));
         if (!v || v < 1) return Response.json({ error: "domainHourlyLimit must be >= 1" }, { status: 400, headers });
         await setConfig(env.DB, "domain_hourly_limit", String(v));
+      }
+      if (body.domainLifetimeLimit !== undefined) {
+        const v = parseInt(String(body.domainLifetimeLimit));
+        if (!v || v < 1) return Response.json({ error: "domainLifetimeLimit must be >= 1" }, { status: 400, headers });
+        await setConfig(env.DB, "domain_lifetime_limit", String(v));
       }
       if (body.clearSitePassword) await setConfig(env.DB, "site_password_hash", "");
       if (body.sitePassword) {
@@ -526,16 +542,21 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
       return Response.json({ error: "address and password required" }, { status: 400, headers });
     }
     const address = body.address.toLowerCase();
-    const [existingPassword, existingEmail] = await Promise.all([
+    const addrDomain = address.includes("@") ? address.slice(address.indexOf("@") + 1) : "";
+    const [existingPassword, existingEmail, lifetimeUsed, { domainLifetime }] = await Promise.all([
       env.DB.prepare("SELECT address FROM passwords WHERE address = ? LIMIT 1").bind(address).first(),
       env.DB.prepare("SELECT mail_to FROM emails WHERE mail_to = ? LIMIT 1").bind(address).first(),
+      getDomainLifetimeUsed(env.DB, addrDomain),
+      getLimits(env.DB),
     ]);
     if (existingPassword || existingEmail) {
       return Response.json({ error: "address already exists" }, { status: 409, headers });
     }
+    if (lifetimeUsed >= domainLifetime) {
+      return Response.json({ error: "domain lifetime quota exceeded" }, { status: 429, headers });
+    }
     const now = Date.now();
     // Save as unconfirmed (confirmed=0); quota is checked and consumed only when email arrives
-    const addrDomain = address.includes("@") ? address.slice(address.indexOf("@") + 1) : "";
     await env.DB.prepare(
       "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain) VALUES (?, ?, ?, 0, ?, ?, ?)"
     ).bind(address, body.password, body.label || "", now, now, addrDomain).run();
@@ -623,6 +644,122 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return Response.json({ email: row }, { headers });
   }
 
+  // POST /api/generate-address — generate + register a new address for a profile
+  if (url.pathname === "/api/generate-address" && request.method === "POST") {
+    if (!checkAuth(request, env)) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const body = await request.json() as { profile_id: string };
+    if (!body.profile_id) return Response.json({ error: "profile_id required" }, { status: 400, headers });
+
+    const NAMES = ["james","john","robert","michael","william","david","richard","joseph","thomas","charles",
+      "mary","patricia","jennifer","linda","barbara","elizabeth","susan","jessica","sarah","karen",
+      "alex","chris","jordan","taylor","morgan","casey","riley","jamie","avery","skyler",
+      "emma","liam","noah","olivia","sophia","lucas","mason","ethan","ava","isabella",
+      "jack","lily","ryan","grace","owen","zoe","evan","chloe","sean","maya"];
+    const allDomains = await getDomains(env.DB);
+    if (!allDomains.length) return Response.json({ error: "no domains" }, { status: 500, headers });
+
+    // Exclude domains already assigned to this profile
+    const usedRows = await env.DB.prepare(
+      "SELECT address FROM profile_addresses WHERE profile_id = ?"
+    ).bind(body.profile_id).all();
+    const usedDomains = new Set(
+      (usedRows.results || []).map((r: Record<string, unknown>) => (r.address as string).split("@")[1])
+    );
+    // Prefer unused domains; fall back to all domains if all are used
+    const preferredDomains = allDomains.filter(d => !usedDomains.has(d));
+    const candidateDomains = preferredDomains.length > 0 ? preferredDomains : allDomains;
+
+    // Filter out domains that have reached lifetime quota
+    const { domainLifetime } = await getLimits(env.DB);
+    const lifetimeCounts = await Promise.all(
+      candidateDomains.map(d => getDomainLifetimeUsed(env.DB, d).then(count => ({ d, count })))
+    );
+    const domains = lifetimeCounts.filter(({ count }) => count < domainLifetime).map(({ d }) => d);
+    if (!domains.length) return Response.json({ error: "all domains have reached lifetime quota" }, { status: 429, headers });
+
+    let address = "";
+    for (let i = 0; i < 10; i++) {
+      const name = NAMES[Math.floor(Math.random() * NAMES.length)];
+      const num = Math.floor(Math.random() * 900) + 10;
+      const domain = domains[Math.floor(Math.random() * domains.length)];
+      const candidate = `${name}${num}@${domain}`;
+      const existing = await env.DB.prepare("SELECT address FROM passwords WHERE address = ?").bind(candidate).first();
+      if (!existing) { address = candidate; break; }
+    }
+    if (!address) return Response.json({ error: "could not generate unique address" }, { status: 500, headers });
+
+    const now = Date.now();
+    const domain = address.split("@")[1];
+    await env.DB.prepare(
+      "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain) VALUES (?, ?, ?, 0, ?, ?, ?)"
+    ).bind(address, generatePassword(), "", now, now, domain).run();
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO profile_addresses (address, profile_id, assigned_at) VALUES (?, ?, ?)"
+    ).bind(address, body.profile_id, now).run();
+
+    return Response.json({ ok: true, address }, { headers });
+  }
+
+  // POST /api/profile-address — assign addresses to a profile (admin only)
+  // body: { profile_id, addresses: string[] }
+  if (url.pathname === "/api/profile-address" && request.method === "POST") {
+    if (!checkAuth(request, env)) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const body = await request.json() as { profile_id: string; addresses: string[] };
+    if (!body.profile_id || !Array.isArray(body.addresses)) {
+      return Response.json({ error: "profile_id and addresses required" }, { status: 400, headers });
+    }
+    const now = Date.now();
+    for (const addr of body.addresses) {
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO profile_addresses (address, profile_id, assigned_at) VALUES (?, ?, ?)"
+      ).bind(addr.toLowerCase(), body.profile_id, now).run();
+    }
+    return Response.json({ ok: true }, { headers });
+  }
+
+  // GET /api/profile-address?profile_id=xxx — get addresses assigned to a profile
+  if (url.pathname === "/api/profile-address" && request.method === "GET") {
+    const profileId = url.searchParams.get("profile_id") || "";
+    if (!profileId) return Response.json({ error: "profile_id required" }, { status: 400, headers });
+    const rows = await env.DB.prepare(
+      "SELECT address FROM profile_addresses WHERE profile_id = ? ORDER BY assigned_at DESC"
+    ).bind(profileId).all();
+    return Response.json({ addresses: (rows.results || []).map((r: Record<string, unknown>) => r.address) }, { headers });
+  }
+
+  // POST /api/activation-link — push a link for a profile (admin only)
+  if (url.pathname === "/api/activation-link" && request.method === "POST") {
+    if (!checkAuth(request, env)) {
+      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    }
+    const body = await request.json() as { profile_id: string; url: string };
+    if (!body.profile_id || !body.url) {
+      return Response.json({ error: "profile_id and url required" }, { status: 400, headers });
+    }
+    const id = generateId();
+    await env.DB.prepare(
+      "INSERT INTO activation_links (id, profile_id, url, created_at, consumed) VALUES (?, ?, ?, ?, 0)"
+    ).bind(id, body.profile_id, body.url, Date.now()).run();
+    return Response.json({ ok: true, id }, { headers });
+  }
+
+  // GET /api/activation-link?profile_id=xxx — poll for pending links (no auth, profile_id is the token)
+  if (url.pathname === "/api/activation-link" && request.method === "GET") {
+    const profileId = url.searchParams.get("profile_id") || "";
+    if (!profileId) return Response.json({ error: "profile_id required" }, { status: 400, headers });
+    const rows = await env.DB.prepare(
+      "SELECT id, url FROM activation_links WHERE profile_id = ? AND consumed = 0 ORDER BY created_at ASC LIMIT 10"
+    ).bind(profileId).all();
+    return Response.json({ links: rows.results || [] }, { headers });
+  }
+
+  // POST /api/activation-link/:id/consume — mark as consumed
+  if (url.pathname.match(/^\/api\/activation-link\/[^/]+\/consume$/) && request.method === "POST") {
+    const id = url.pathname.split("/")[3];
+    await env.DB.prepare("UPDATE activation_links SET consumed = 1 WHERE id = ?").bind(id).run();
+    return Response.json({ ok: true }, { headers });
+  }
+
   // GET /api/domain-quota?domain=xxx — single domain quota (kept for backwards compat)
   if (url.pathname === "/api/domain-quota" && request.method === "GET") {
     const domain = (url.searchParams.get("domain") || "").toLowerCase();
@@ -646,22 +783,27 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const hourStart = new Date(now);
     hourStart.setMinutes(0, 0, 0);
 
-    const [dailyRows, hourlyRows] = await Promise.all([
+    const [dailyRows, hourlyRows, lifetimeRows] = await Promise.all([
       env.DB.prepare(
         "SELECT domain, COUNT(*) as count FROM passwords WHERE confirmed = 1 AND created_at >= ? AND domain IS NOT NULL GROUP BY domain"
       ).bind(todayStart.getTime()).all(),
       env.DB.prepare(
         "SELECT domain, COUNT(*) as count FROM passwords WHERE confirmed = 1 AND created_at >= ? AND domain IS NOT NULL GROUP BY domain"
       ).bind(hourStart.getTime()).all(),
+      env.DB.prepare(
+        "SELECT domain, COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain IS NOT NULL GROUP BY domain"
+      ).all(),
     ]);
 
     const daily: Record<string, number> = {};
     const hourly: Record<string, number> = {};
+    const lifetime: Record<string, number> = {};
     for (const r of (dailyRows.results || []) as { domain: string; count: number }[]) daily[r.domain] = r.count;
     for (const r of (hourlyRows.results || []) as { domain: string; count: number }[]) hourly[r.domain] = r.count;
+    for (const r of (lifetimeRows.results || []) as { domain: string; count: number }[]) lifetime[r.domain] = r.count;
 
-    const { domainDaily, domainHourly } = await getLimits(env.DB);
-    return Response.json({ daily, hourly, hourlyLimit: domainHourly, dailyLimit: domainDaily }, { headers });
+    const { domainDaily, domainHourly, domainLifetime } = await getLimits(env.DB);
+    return Response.json({ daily, hourly, lifetime, hourlyLimit: domainHourly, dailyLimit: domainDaily, lifetimeLimit: domainLifetime }, { headers });
   }
 
   // GET /api/tag-quota?label=xxx — confirmed (received email) addresses for a tag today (resets 23:30 ET)
@@ -795,7 +937,7 @@ export default {
   async email(message: ForwardableEmailMessage, env: Env): Promise<void> {
     const to = message.to.toLowerCase();
     const [localPart, domain] = to.split("@");
-    const { tagDaily, domainDaily, domainHourly } = await getLimits(env.DB);
+    const { tagDaily, domainDaily, domainHourly, domainLifetime } = await getLimits(env.DB);
 
     const [domains, domainsPool2, forwardRules, tagRules] = await Promise.all([
       getDomains(env.DB),
@@ -860,7 +1002,7 @@ export default {
     // On first email: confirm the address (quota is consumed here, not at generation time)
     if (preRegistered) {
       if (!preRegistered.confirmed) {
-        // First email for this address — enforce tag daily quota before confirming
+        // First email for this address — enforce tag daily quota and domain lifetime quota before confirming
         if (tag) {
           const resetTs = getLastEasternReset();
           const tagCount = await env.DB.prepare(
@@ -868,6 +1010,7 @@ export default {
           ).bind(tag, resetTs).first() as { count: number } | null;
           if ((tagCount?.count || 0) >= tagDaily) return; // quota full, drop email silently
         }
+        if ((await getDomainLifetimeUsed(env.DB, domain)) >= domainLifetime) return;
         await env.DB.prepare(
           "UPDATE passwords SET confirmed = 1, updated_at = ? WHERE address = ?"
         ).bind(now, accountAddress).run();
@@ -882,7 +1025,7 @@ export default {
       ).bind(accountAddress).first() as { address: string; confirmed: number } | null;
       if (existing) {
         if (!existing.confirmed) {
-          // First email — enforce tag quota
+          // First email — enforce tag quota and domain lifetime quota
           if (tag) {
             const resetTs = getLastEasternReset();
             const tagCount = await env.DB.prepare(
@@ -890,6 +1033,7 @@ export default {
             ).bind(tag, resetTs).first() as { count: number } | null;
             if ((tagCount?.count || 0) >= tagDaily) return;
           }
+          if ((await getDomainLifetimeUsed(env.DB, domain)) >= domainLifetime) return;
           await env.DB.prepare(
             "UPDATE passwords SET confirmed = 1, updated_at = ? WHERE address = ?"
           ).bind(now, accountAddress).run();
@@ -902,11 +1046,12 @@ export default {
         // Old-format dash-tag fallback: enforce domain quota then auto-create as confirmed
         const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
         const hourStart = new Date(); hourStart.setMinutes(0, 0, 0);
-        const [dailyRow, hourlyRow] = await Promise.all([
+        const [dailyRow, hourlyRow, lifetimeUsed] = await Promise.all([
           env.DB.prepare("SELECT COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain = ? AND created_at >= ?").bind(domain, todayStart.getTime()).first() as Promise<{ count: number } | null>,
           env.DB.prepare("SELECT COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain = ? AND created_at >= ?").bind(domain, hourStart.getTime()).first() as Promise<{ count: number } | null>,
+          getDomainLifetimeUsed(env.DB, domain),
         ]);
-        if ((dailyRow?.count || 0) >= domainDaily || (hourlyRow?.count || 0) >= domainHourly) return;
+        if ((dailyRow?.count || 0) >= domainDaily || (hourlyRow?.count || 0) >= domainHourly || lifetimeUsed >= domainLifetime) return;
         await env.DB.prepare(
           "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain) VALUES (?, ?, ?, 1, ?, ?, ?)"
         ).bind(accountAddress, generatePassword(), tag, now, now, domain).run();
@@ -932,6 +1077,20 @@ export default {
         await env.DB.prepare(
           "UPDATE passwords SET last_link_received_at = ? WHERE address = ?"
         ).bind(now, accountAddress).run();
+
+        // Auto-push activation link to profile if address is assigned
+        const profileRow = await env.DB.prepare(
+          "SELECT profile_id FROM profile_addresses WHERE address = ?"
+        ).bind(accountAddress).first() as { profile_id: string } | null;
+        if (profileRow) {
+          const linkMatch = content.match(/https?:\/\/[^\s"'<>)]+/g)
+            ?.find(u => u.includes(linkFilter));
+          if (linkMatch) {
+            await env.DB.prepare(
+              "INSERT INTO activation_links (id, profile_id, url, created_at, consumed) VALUES (?, ?, ?, ?, 0)"
+            ).bind(generateId(), profileRow.profile_id, linkMatch.replace(/[.,;]+$/, ""), now).run();
+          }
+        }
       }
     }
   },

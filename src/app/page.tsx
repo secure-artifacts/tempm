@@ -53,7 +53,7 @@ function extractLinks(html: string, text: string): string[] {
 
 // ── Generate Email Panel (per-tag address generator) ───────────────────────
 function GenerateEmailPanel({ tag, allDomains, adminToken, sseDisabled }: { tag: string; allDomains: string[]; adminToken: string; sseDisabled?: boolean }) {
-  const [domainQuotas, setDomainQuotas] = useState<Record<string, { used: number; limit: number; hourlyUsed: number; hourlyLimit: number }>>({});
+  const [domainQuotas, setDomainQuotas] = useState<Record<string, { used: number; limit: number; hourlyUsed: number; hourlyLimit: number; lifetimeUsed: number; lifetimeLimit: number }>>({});
   const [tagQuota, setTagQuota] = useState<{ used: number; limit: number; remaining: number } | null>(null);
   const [generated, setGenerated] = useState("");
   const [toast, setToast] = useState<string | null>(null);
@@ -73,14 +73,16 @@ function GenerateEmailPanel({ tag, allDomains, adminToken, sseDisabled }: { tag:
     try {
       const res = await fetch(`${WORKER_URL}/api/domain-quotas`);
       if (!res.ok) return;
-      const data = await res.json() as { daily: Record<string, number>; hourly: Record<string, number>; hourlyLimit: number; dailyLimit: number };
-      const q: Record<string, { used: number; limit: number; hourlyUsed: number; hourlyLimit: number }> = {};
+      const data = await res.json() as { daily: Record<string, number>; hourly: Record<string, number>; lifetime: Record<string, number>; hourlyLimit: number; dailyLimit: number; lifetimeLimit: number };
+      const q: Record<string, { used: number; limit: number; hourlyUsed: number; hourlyLimit: number; lifetimeUsed: number; lifetimeLimit: number }> = {};
       for (const d of domainList) {
         q[d] = {
           used: data.daily[d.toLowerCase()] || 0,
           limit: data.dailyLimit,
           hourlyUsed: data.hourly[d.toLowerCase()] || 0,
           hourlyLimit: data.hourlyLimit,
+          lifetimeUsed: data.lifetime?.[d.toLowerCase()] || 0,
+          lifetimeLimit: data.lifetimeLimit || 500,
         };
       }
       setDomainQuotas(q);
@@ -146,11 +148,12 @@ function GenerateEmailPanel({ tag, allDomains, adminToken, sseDisabled }: { tag:
       return;
     }
 
-    // Pick randomly from enabled + quota-available domains
+    // Pick randomly from enabled + quota-available domains (lifetime-full domains are always excluded)
     const available = allDomains.filter(d => {
       if (!enabledDomains.has(d)) return false;
       const q = domainQuotas[d];
       if (!q) return false;
+      if (q.lifetimeUsed >= q.lifetimeLimit) return false;
       return q.used < q.limit && q.hourlyUsed < q.hourlyLimit;
     });
     if (available.length === 0) {
@@ -193,7 +196,7 @@ function GenerateEmailPanel({ tag, allDomains, adminToken, sseDisabled }: { tag:
 
   const allDomainsFull = quotasLoaded && allDomains.length > 0 && allDomains
     .filter(d => enabledDomains.has(d))
-    .every(d => { const q = domainQuotas[d]; return !q || q.used >= q.limit || q.hourlyUsed >= q.hourlyLimit; });
+    .every(d => { const q = domainQuotas[d]; return !q || q.lifetimeUsed >= q.lifetimeLimit || q.used >= q.limit || q.hourlyUsed >= q.hourlyLimit; });
   const disabled = !poolReady || !quotasLoaded || allDomainsFull || !!sseDisabled;
 
   return (
@@ -259,22 +262,26 @@ function GenerateEmailPanel({ tag, allDomains, adminToken, sseDisabled }: { tag:
           <div className="mt-2 space-y-1">
             {allDomains.map(d => {
               const q = domainQuotas[d];
+              const lifetimeFull = q ? q.lifetimeUsed >= q.lifetimeLimit : false;
               const dailyRem = q ? q.limit - q.used : null;
               const hourlyRem = q ? q.hourlyLimit - q.hourlyUsed : null;
-              const full = (dailyRem !== null && dailyRem <= 0) || (hourlyRem !== null && hourlyRem <= 0);
+              const temporaryFull = !lifetimeFull && ((dailyRem !== null && dailyRem <= 0) || (hourlyRem !== null && hourlyRem <= 0));
               return (
-                <label key={d} className="flex items-center gap-2 cursor-pointer select-none">
+                <label key={d} className={`flex items-center gap-2 select-none ${lifetimeFull ? "cursor-not-allowed" : "cursor-pointer"}`}>
                   <input
                     type="checkbox"
                     checked={enabledDomains.has(d)}
                     onChange={() => toggleDomain(d)}
+                    disabled={lifetimeFull}
                     className="accent-green-500"
                   />
-                  <span className={`text-xs font-mono ${full ? "text-gray-400 line-through" : "text-gray-700"}`}>
+                  <span className={`text-xs font-mono ${lifetimeFull ? "text-red-400 line-through" : temporaryFull ? "text-gray-400 line-through" : "text-gray-700"}`}>
                     {d}
                   </span>
                   {!quotasLoaded ? (
                     <span className="text-xs text-gray-300">···</span>
+                  ) : lifetimeFull ? (
+                    <span className="text-xs text-red-400 font-medium">终身已满·不可用</span>
                   ) : q ? (
                     <span className="text-xs text-gray-400">
                       今日剩 {dailyRem}/{q.limit} · 本时剩 {hourlyRem}/{q.hourlyLimit}
@@ -866,7 +873,7 @@ export default function Home() {
   const [endDate,   setEndDate]   = useState("");
   const [linkDays, setLinkDays] = useState("");
   const [page, setPage] = useState(1);
-  const PAGE_SIZE = 50;
+  const PAGE_SIZE = 40;
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 2200); };
   const copy = async (text: string, label = "已复制") => {

@@ -39,6 +39,7 @@
     "node_modules",
     "worker",
     "warmup-worker",
-    "landing-worker"
+    "landing-worker",
+    "open-next.config.ts"
   ]
 }

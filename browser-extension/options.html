@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>TempMail Activator 设置</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 420px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #1e293b;
+      font-size: 14px;
+    }
+    h2 { color: #4f46e5; margin-bottom: 20px; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; color: #475569; }
+    input {
+      width: 100%;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 14px;
+      font-family: monospace;
+      outline: none;
+    }
+    input:focus { border-color: #4f46e5; }
+    .hint { font-size: 12px; color: #94a3b8; margin-top: 6px; }
+    button {
+      margin-top: 16px;
+      background: #4f46e5;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 9px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #4338ca; }
+    .saved { color: #16a34a; font-size: 13px; margin-top: 10px; display: none; }
+  </style>
+</head>
+<body>
+  <h2>✉️ TempMail Activator 设置</h2>
+  <label>Profile ID</label>
+  <input id="pid" type="text" placeholder="例如：profile-9 或 steve-01">
+  <div class="hint">每个 Chrome Profile 填一个唯一的 ID，Claude 用这个 ID 向你推送地址和激活链接。</div>
+  <button id="save">保存</button>
+  <div class="saved" id="saved">✓ 已保存</div>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "TempMail Activator",
+  "version": "2.0",
+  "description": "接收临时邮箱地址，自动打开激活链接",
+  "permissions": ["tabs", "storage", "alarms"],
+  "host_permissions": [
+    "https://temp-mail-worker.YOUR_SUBDOMAIN.workers.dev/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html"
+}

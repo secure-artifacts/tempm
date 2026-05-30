@@ -2,18 +2,20 @@ name = "temp-mail-worker"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 workers_dev = true
-account_id = "5655f90a319d15917733eea6529e89a7"
+account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
 
 # D1 Database binding
 [[d1_databases]]
 binding = "DB"
 database_name = "temp-mail-db"
-database_id = "408fae3e-3d7c-492e-ac1a-2407e09ab9cc"
+database_id = "YOUR_D1_DATABASE_ID"
 
 [triggers]
 crons = ["0 3 * * *"]
 
 [vars]
 # Comma-separated list of allowed frontend origins (for CORS)
-ALLOWED_ORIGINS = "https://temp-mail-nine-nu.vercel.app,https://temp-mail-one-nu.vercel.app,https://temp-mail-83oxnvzp7-kaylamartinez200221-6476s-projects.vercel.app,http://localhost:3000"
-ADMIN_PASSWORD = "TempMail@2026!"
+ALLOWED_ORIGINS = "https://your-app.vercel.app,http://localhost:3000"
+# Prefer setting the admin password as a secret instead of committing it:
+#   npx wrangler secret put ADMIN_PASSWORD
+ADMIN_PASSWORD = "change-me"

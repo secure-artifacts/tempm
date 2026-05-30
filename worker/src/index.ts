@@ -2,6 +2,9 @@ export interface Env {
   DB: D1Database;
   ALLOWED_ORIGINS: string;
   ADMIN_PASSWORD: string;
+  HERMES_SHARED_SECRET?: string;
+  HERMES_USERNAME?: string;
+  HERMES_LINK_MATCH?: string;
 }
 
 interface ForwardRule {
@@ -9,13 +12,27 @@ interface ForwardRule {
   target: string;
 }
 
-// e.g. { tag: "vip", target: "you@gmail.com" }
-// triggers when email arrives at anything+vip@domain
-interface TagRule {
-  tag: string;
-  target: string;
-  label?: string; // optional display name
+interface User {
+  id: string;
+  username: string;
+  password_hash: string;
+  is_admin: number;
+  daily_limit: number;
+  hourly_limit: number;
+  lifetime_limit: number;
+  created_at: number;
 }
+
+// Resolved request actor: admin (ADMIN_PASSWORD bearer) or a logged-in user.
+type Actor = { isAdmin: boolean; user: User | null };
+
+// Defaults for newly created users (per-domain quotas).
+const DEFAULT_DAILY_LIMIT = 20;
+const DEFAULT_HOURLY_LIMIT = 5;
+const DEFAULT_LIFETIME_LIMIT = 500;
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const DEFAULT_HERMES_USERNAME = "steven";
+const DEFAULT_HERMES_LINK_MATCH = "https://app.heygen.com/magic-web,https://auth.heygen.com/magic-web";
 
 // ========== Helpers ==========
 
@@ -44,6 +61,18 @@ function generatePassword(): string {
 
 function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).substring(2, 10);
+}
+
+function randomToken(): string {
+  const arr = new Uint8Array(32);
+  crypto.getRandomValues(arr);
+  return Array.from(arr).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function corsHeaders(request: Request, env: Env): Record<string, string> {
@@ -111,26 +140,22 @@ async function getForwardRules(db: D1Database): Promise<ForwardRule[]> {
   try { return JSON.parse(raw); } catch { return []; }
 }
 
-async function getTagRules(db: D1Database): Promise<TagRule[]> {
-  const raw = await getConfig(db, "tag_rules");
-  try { return JSON.parse(raw); } catch { return []; }
-}
-
-async function getLimits(db: D1Database) {
-  const [t, d, h, l] = await Promise.all([
-    getConfig(db, "tag_daily_limit"),
-    getConfig(db, "domain_daily_limit"),
-    getConfig(db, "domain_hourly_limit"),
-    getConfig(db, "domain_lifetime_limit"),
+// Set of all configured (Cloudflare-routed) domains: pool1 + pool2 + forward subdomains.
+async function getConfiguredDomains(db: D1Database): Promise<Set<string>> {
+  const [domains, pool2, forwardRules] = await Promise.all([
+    getDomains(db),
+    getDomainsPool2(db),
+    getForwardRules(db),
   ]);
-  return {
-    tagDaily: parseInt(t) || 30,
-    domainDaily: parseInt(d) || 20,
-    domainHourly: parseInt(h) || 5,
-    domainLifetime: parseInt(l) || 500,
-  };
+  return new Set([
+    ...domains.map((d) => d.toLowerCase()),
+    ...pool2.map((d) => d.toLowerCase()),
+    ...forwardRules.map((r) => r.subdomain.toLowerCase()),
+  ]);
 }
 
+// Lifetime count for a domain = confirmed (received-email) addresses ever. Since
+// domains are exclusively owned, this is also the owner's lifetime count for it.
 async function getDomainLifetimeUsed(db: D1Database, domain: string): Promise<number> {
   const row = await db.prepare(
     "SELECT COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain = ?"
@@ -138,19 +163,57 @@ async function getDomainLifetimeUsed(db: D1Database, domain: string): Promise<nu
   return row?.count || 0;
 }
 
-// Parse -tag suffix from email local part using last dash segment
-// "john42-ck" → { local: "john42", tag: "ck" }
-// "smith-jones" (no matching tag) → { local: "smith-jones", tag: null }
-// Only strips the suffix if it matches a known tag; otherwise keeps whole string
-function parseDashTag(localPart: string, knownTags: string[]): { local: string; tag: string | null } {
-  const idx = localPart.lastIndexOf("-");
-  if (idx === -1) return { local: localPart, tag: null };
-  const suffix = localPart.substring(idx + 1);
-  const prefix = localPart.substring(0, idx);
-  if (knownTags.includes(suffix.toLowerCase())) {
-    return { local: prefix, tag: suffix.toLowerCase() };
-  }
-  return { local: localPart, tag: null };
+// hourly (clock-hour), daily (since 23:30 ET reset), lifetime confirmed counts for a domain.
+async function getDomainCounts(db: D1Database, domain: string): Promise<{ daily: number; hourly: number; lifetime: number }> {
+  const resetTs = getLastEasternReset();
+  const hourStart = new Date();
+  hourStart.setMinutes(0, 0, 0);
+  const [d, h, l] = await Promise.all([
+    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE confirmed = 1 AND domain = ? AND created_at >= ?").bind(domain, resetTs).first() as Promise<{ c: number } | null>,
+    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE confirmed = 1 AND domain = ? AND created_at >= ?").bind(domain, hourStart.getTime()).first() as Promise<{ c: number } | null>,
+    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE confirmed = 1 AND domain = ?").bind(domain).first() as Promise<{ c: number } | null>,
+  ]);
+  return { daily: d?.c || 0, hourly: h?.c || 0, lifetime: l?.c || 0 };
+}
+
+// ========== Users / Sessions / Ownership ==========
+
+async function getUserByUsername(db: D1Database, username: string): Promise<User | null> {
+  return await db.prepare("SELECT * FROM users WHERE username = ?").bind(username).first() as User | null;
+}
+
+async function getUserById(db: D1Database, id: string): Promise<User | null> {
+  return await db.prepare("SELECT * FROM users WHERE id = ?").bind(id).first() as User | null;
+}
+
+async function createSession(db: D1Database, userId: string): Promise<string> {
+  const token = randomToken();
+  const now = Date.now();
+  await db.prepare(
+    "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)"
+  ).bind(token, userId, now, now + SESSION_TTL_MS).run();
+  return token;
+}
+
+async function resolveSession(db: D1Database, token: string): Promise<User | null> {
+  const row = await db.prepare(
+    "SELECT user_id, expires_at FROM sessions WHERE token = ?"
+  ).bind(token).first() as { user_id: string; expires_at: number } | null;
+  if (!row || row.expires_at < Date.now()) return null;
+  return await getUserById(db, row.user_id);
+}
+
+async function resolveActorByToken(env: Env, token: string): Promise<Actor | null> {
+  if (!token) return null;
+  if (token === env.ADMIN_PASSWORD) return { isAdmin: true, user: null };
+  const user = await resolveSession(env.DB, token);
+  return user ? { isAdmin: false, user } : null;
+}
+
+async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
+  const auth = request.headers.get("Authorization") || "";
+  if (!auth.startsWith("Bearer ")) return null;
+  return resolveActorByToken(env, auth.slice(7));
 }
 
 function checkAuth(request: Request, env: Env): boolean {
@@ -158,29 +221,170 @@ function checkAuth(request: Request, env: Env): boolean {
   return auth === `Bearer ${env.ADMIN_PASSWORD}`;
 }
 
-async function checkAuthFull(request: Request, env: Env): Promise<boolean> {
-  if (checkAuth(request, env)) return true;
+function checkHermesAuth(request: Request, env: Env): boolean {
+  const secret = env.HERMES_SHARED_SECRET || "";
+  if (!secret) return false;
   const auth = request.headers.get("Authorization") || "";
-  if (!auth.startsWith("Bearer ")) return false;
-  return await checkPassword(auth.slice(7), env);
+  return auth === `Bearer ${secret}`;
 }
 
-async function checkPassword(password: string, env: Env): Promise<boolean> {
-  if (password === env.ADMIN_PASSWORD) return true;
-  const storedHash = await getConfig(env.DB, "site_password_hash");
-  if (!storedHash) return false;
-  const data = new TextEncoder().encode(password);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, "0")).join("");
-  return hashHex === storedHash;
+function getHermesUsername(env: Env): string {
+  return (env.HERMES_USERNAME || DEFAULT_HERMES_USERNAME).trim().toLowerCase();
 }
 
-async function checkAuthFullOrQueryToken(request: Request, env: Env, url: URL): Promise<boolean> {
-  if (await checkAuthFull(request, env)) return true;
-  const token = url.searchParams.get("token") || "";
-  return token ? await checkPassword(token, env) : false;
+function getHermesLinkMatch(env: Env): string {
+  return (env.HERMES_LINK_MATCH || DEFAULT_HERMES_LINK_MATCH).trim();
 }
 
+function getHermesLinkMatches(env: Env): string[] {
+  return getHermesLinkMatch(env).split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+async function getDomainOwner(db: D1Database, domain: string): Promise<{ owner_id: string; enabled: number } | null> {
+  return await db.prepare(
+    "SELECT owner_id, enabled FROM domain_owner WHERE domain = ?"
+  ).bind(domain).first() as { owner_id: string; enabled: number } | null;
+}
+
+async function getUserDomains(db: D1Database, userId: string): Promise<{ domain: string; enabled: number }[]> {
+  const rows = await db.prepare(
+    "SELECT domain, enabled FROM domain_owner WHERE owner_id = ? ORDER BY domain"
+  ).bind(userId).all();
+  return (rows.results || []) as { domain: string; enabled: number }[];
+}
+
+// Word lists for human-looking local parts. Kept in sync with the frontend's
+// src/lib/utils.ts so manual and auto-generated addresses share one scheme.
+const FIRST_NAMES = [
+  "james","john","robert","michael","william","david","richard","joseph","thomas","charles",
+  "mary","patricia","jennifer","linda","barbara","elizabeth","susan","jessica","sarah","karen",
+  "alex","chris","jordan","taylor","morgan","casey","riley","jamie","avery","skyler",
+  "emma","liam","noah","olivia","sophia","lucas","mason","ethan","ava","isabella",
+  "jack","lily","ryan","grace","owen","zoe","evan","chloe","sean","maya",
+];
+const LAST_NAMES = [
+  "smith","johnson","williams","brown","jones","garcia","miller","davis","rodriguez","martinez",
+  "hernandez","lopez","gonzalez","wilson","anderson","thomas","taylor","moore","jackson","martin",
+  "lee","perez","thompson","white","harris","sanchez","clark","ramirez","lewis","robinson",
+  "walker","young","allen","king","wright","scott","torres","hill","flores","green",
+  "adams","nelson","baker","hall","rivera","campbell","mitchell","carter","roberts","reed",
+];
+const ADJECTIVES = [
+  "blue","happy","silent","brave","calm","clever","cosmic","golden","lucky","mellow",
+  "noble","quick","rapid","shiny","swift","witty","bright","bold","crisp","fancy",
+  "gentle","jolly","keen","lively","misty","proud","royal","sunny","vivid","zen",
+];
+const NOUNS = [
+  "falcon","otter","tiger","river","maple","comet","willow","harbor","meadow","canyon",
+  "ember","pixel","cobra","lynx","raven","badger","panda","koala","heron","marlin",
+  "quartz","cedar","orchid","summit","breeze","lotus","onyx","drift","wren","fox",
+];
+// Excludes easily-confused chars: 0 o 1 l i
+const SAFE_CHARS = "abcdefghjkmnpqrstuvwxyz23456789";
+
+function randInt(max: number): number {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  const limit = Math.floor(0xffffffff / max) * max;
+  while (buf[0] >= limit) crypto.getRandomValues(buf);
+  return buf[0] % max;
+}
+
+function pick<T>(arr: T[]): T {
+  return arr[randInt(arr.length)];
+}
+
+function randomChars(length: number): string {
+  let result = "";
+  for (let i = 0; i < length; i++) result += SAFE_CHARS.charAt(randInt(SAFE_CHARS.length));
+  return result;
+}
+
+// Generate a human-looking, lowercase local part by mixing templates.
+function generateLocalPart(): string {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const sep = pick(["", "", "", ".", "_"]);
+    let v: string;
+    switch (randInt(4)) {
+      case 0:
+        v = `${pick(FIRST_NAMES)}${sep}${pick(LAST_NAMES)}${randInt(990) + 7}`;
+        break;
+      case 1:
+        v = `${pick(FIRST_NAMES)}${pick(LAST_NAMES)}${randInt(90) + 10}`;
+        break;
+      case 2:
+        v = `${pick(ADJECTIVES)}${pick(NOUNS)}${randInt(90) + 10}`;
+        break;
+      default:
+        v = `${pick(FIRST_NAMES)}${sep || "."}${randomChars(4)}`;
+        break;
+    }
+    if (v.length >= 6 && v.length <= 20) return v;
+  }
+  return `${pick(FIRST_NAMES)}${randInt(990) + 7}`;
+}
+
+async function generateAddressForOwner(
+  db: D1Database,
+  owner: User,
+  profileId: string,
+  count = 1,
+): Promise<string[]> {
+  const userDomains = await getUserDomains(db, owner.id);
+  const enabledDomains = userDomains.filter((d) => d.enabled).map((d) => d.domain);
+  if (!enabledDomains.length) {
+    throw new Error("no enabled domains for owner");
+  }
+
+  const usedRows = await db.prepare(
+    "SELECT address FROM profile_addresses WHERE profile_id = ?"
+  ).bind(profileId).all();
+  const usedDomains = new Set(
+    (usedRows.results || []).map((r: Record<string, unknown>) => String(r.address).split("@")[1].toLowerCase())
+  );
+  const preferredDomains = enabledDomains.filter((d) => !usedDomains.has(d.toLowerCase()));
+  const candidateDomains = preferredDomains.length > 0 ? preferredDomains : enabledDomains;
+
+  const lifetimeCounts = await Promise.all(
+    candidateDomains.map((d) => getDomainLifetimeUsed(db, d).then((used) => ({ domain: d, used })))
+  );
+  const eligibleDomains = lifetimeCounts
+    .filter(({ used }) => used < owner.lifetime_limit)
+    .map(({ domain }) => domain);
+  if (!eligibleDomains.length) {
+    throw new Error("all owner domains have reached lifetime quota");
+  }
+
+  const generated: string[] = [];
+  let attempts = 0;
+  const maxAttempts = Math.max(20, count * 20);
+
+  while (generated.length < count && attempts < maxAttempts) {
+    attempts += 1;
+    const domain = eligibleDomains[Math.floor(Math.random() * eligibleDomains.length)];
+    const address = `${generateLocalPart()}@${domain}`;
+    if (generated.includes(address)) continue;
+    const existing = await db.prepare(
+      "SELECT address FROM passwords WHERE address = ? LIMIT 1"
+    ).bind(address).first();
+    if (existing) continue;
+
+    const now = Date.now();
+    await db.prepare(
+      "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain, owner_id) VALUES (?, ?, '', 0, ?, ?, ?, ?)"
+    ).bind(address, generatePassword(), now, now, domain, owner.id).run();
+    await db.prepare(
+      "INSERT OR REPLACE INTO profile_addresses (address, profile_id, assigned_at) VALUES (?, ?, ?)"
+    ).bind(address, profileId, now).run();
+    generated.push(address);
+  }
+
+  if (generated.length < count) {
+    throw new Error(`only generated ${generated.length}/${count} addresses`);
+  }
+
+  return generated;
+}
 
 // Return the UTC timestamp of the most recent 11:30 PM Eastern reset
 function getLastEasternReset(): number {
@@ -302,6 +506,26 @@ function parseEmailContent(rawEmail: string) {
   };
 }
 
+// Extract the first link matching linkFilter from email content.
+function extractActivationLink(htmlBody: string, textBody: string, linkFilter: string): string | null {
+  if (!linkFilter) return null;
+  const content = (htmlBody || "") + " " + (textBody || "");
+  const re = /https?:\/\/[^\s"'<>)]+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    if (m[0].includes(linkFilter)) return m[0].replace(/[.,;!?]+$/, "");
+  }
+  return null;
+}
+
+function extractFirstMatchingLink(htmlBody: string, textBody: string, linkFilters: string[]): string | null {
+  for (const filter of linkFilters) {
+    const link = extractActivationLink(htmlBody, textBody, filter);
+    if (link) return link;
+  }
+  return null;
+}
+
 // ========== HTTP Request Handler ==========
 
 async function handleFetch(request: Request, env: Env): Promise<Response> {
@@ -312,83 +536,196 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return new Response(null, { headers });
   }
 
-  // GET /api/config
+  // GET /api/config — public, minimal branding/config for the login page
   if (url.pathname === "/api/config" && request.method === "GET") {
-    const domains = await getDomains(env.DB);
-    const domainsPool2 = await getDomainsPool2(env.DB);
-    const forwardRules = await getForwardRules(env.DB);
     const siteName = await getConfig(env.DB, "site_name");
     const autoDeleteHours = await getConfig(env.DB, "auto_delete_hours");
     const linkFilter = await getConfig(env.DB, "link_filter");
-    const sitePasswordHash = await getConfig(env.DB, "site_password_hash");
     return Response.json({
-      domains,
-      domainsPool2,
-      forwardDomains: forwardRules.map((r) => r.subdomain),
       siteName: siteName || "云端接码",
       autoDeleteHours: parseInt(autoDeleteHours) || 24,
       linkFilter: linkFilter || "auth.heygen.com",
-      hasPassword: sitePasswordHash !== "",
     }, { headers });
   }
 
-  // POST /api/site-login
-  if (url.pathname === "/api/site-login" && request.method === "POST") {
-    const raw = await request.text();
-    const body = JSON.parse(raw) as { password: string };
-    const storedHash = await getConfig(env.DB, "site_password_hash");
-    if (!storedHash) {
-      return Response.json({ ok: true }, { headers });
+  // POST /api/login — user login {username,password} → session token
+  if (url.pathname === "/api/login" && request.method === "POST") {
+    const body = JSON.parse(await request.text()) as { username?: string; password?: string };
+    const username = (body.username || "").trim().toLowerCase();
+    if (!username || !body.password) {
+      return Response.json({ error: "用户名和密码必填" }, { status: 400, headers });
     }
-    const encoder = new TextEncoder();
-    const data = encoder.encode(body.password);
-    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    const hashHex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-    if (hashHex === storedHash) {
-      return Response.json({ ok: true }, { headers });
+    const user = await getUserByUsername(env.DB, username);
+    if (!user || user.password_hash !== await sha256Hex(body.password)) {
+      return Response.json({ error: "用户名或密码错误" }, { status: 401, headers });
     }
-    return Response.json({ error: "密码错误" }, { status: 401, headers });
+    const token = await createSession(env.DB, user.id);
+    return Response.json({ ok: true, token, username: user.username, isAdmin: false }, { headers });
   }
 
-  // GET /api/emails?address=xxx@domain.com
-  if (url.pathname === "/api/emails" && request.method === "GET") {
-    if (!await checkAuthFull(request, env)) {
+  // Hermes integration endpoints: dedicated machine-to-machine flow scoped to one user.
+  if (url.pathname.startsWith("/api/hermes/")) {
+    if (!checkHermesAuth(request, env)) {
       return Response.json({ error: "unauthorized" }, { status: 401, headers });
     }
-    const address = (url.searchParams.get("address") || "").toLowerCase();
-    if (!address) {
-      return Response.json({ error: "address required" }, { status: 400, headers });
+    const hermesUser = await getUserByUsername(env.DB, getHermesUsername(env));
+    if (!hermesUser) {
+      return Response.json({ error: "configured hermes user not found" }, { status: 500, headers });
     }
-    const domain = address.split("@")[1];
-    const domains = await getDomains(env.DB);
-    const domainsPool2 = await getDomainsPool2(env.DB);
-    const forwardRules = await getForwardRules(env.DB);
-    const allDomains = [
-      ...domains.map((d) => d.toLowerCase()),
-      ...domainsPool2.map((d) => d.toLowerCase()),
-      ...forwardRules.map((r) => r.subdomain.toLowerCase()),
-    ];
-    if (!allDomains.includes(domain)) {
-      return Response.json({ error: "invalid domain" }, { status: 400, headers });
+
+    if (url.pathname === "/api/hermes/session" && request.method === "POST") {
+      const body = JSON.parse(await request.text() || "{}") as { profile_id?: string };
+      const profileId = (body.profile_id || `hermes_${generateId()}`).trim();
+      if (!profileId) return Response.json({ error: "profile_id required" }, { status: 400, headers });
+      return Response.json({
+        ok: true,
+        profileId,
+        username: hermesUser.username,
+        linkMatch: getHermesLinkMatch(env),
+      }, { headers });
     }
-    const result = await env.DB.prepare(
-      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body as text, html_body as html, timestamp FROM emails WHERE mail_to = ? ORDER BY timestamp DESC LIMIT 50"
-    ).bind(address).all();
-    return Response.json({ emails: result.results || [] }, { headers });
+
+    if (url.pathname === "/api/hermes/generate-address" && request.method === "POST") {
+      const body = JSON.parse(await request.text() || "{}") as { profile_id?: string; count?: number };
+      const profileId = (body.profile_id || "").trim();
+      const count = Math.min(20, Math.max(1, parseInt(String(body.count || 1)) || 1));
+      if (!profileId) return Response.json({ error: "profile_id required" }, { status: 400, headers });
+      try {
+        const addresses = await generateAddressForOwner(env.DB, hermesUser, profileId, count);
+        return Response.json({ ok: true, profileId, addresses }, { headers });
+      } catch (err) {
+        return Response.json({ error: String(err) }, { status: 400, headers });
+      }
+    }
+
+    if (url.pathname === "/api/hermes/profile-addresses" && request.method === "GET") {
+      const profileId = (url.searchParams.get("profile_id") || "").trim();
+      if (!profileId) return Response.json({ error: "profile_id required" }, { status: 400, headers });
+      const rows = await env.DB.prepare(
+        "SELECT address FROM profile_addresses WHERE profile_id = ? ORDER BY assigned_at DESC"
+      ).bind(profileId).all();
+      return Response.json({
+        profileId,
+        addresses: (rows.results || []).map((r: Record<string, unknown>) => r.address),
+      }, { headers });
+    }
+
+    if (url.pathname === "/api/hermes/activation-links" && request.method === "GET") {
+      const profileId = (url.searchParams.get("profile_id") || "").trim();
+      const consume = url.searchParams.get("consume") === "1";
+      if (!profileId) return Response.json({ error: "profile_id required" }, { status: 400, headers });
+      const rows = await env.DB.prepare(
+        "SELECT id, url, created_at FROM activation_links WHERE profile_id = ? AND consumed = 0 ORDER BY created_at ASC LIMIT 20"
+      ).bind(profileId).all();
+      const links = (rows.results || []) as { id: string; url: string; created_at: number }[];
+      if (consume && links.length) {
+        for (const row of links) {
+          await env.DB.prepare("UPDATE activation_links SET consumed = 1 WHERE id = ?").bind(row.id).run();
+        }
+      }
+      return Response.json({ profileId, links }, { headers });
+    }
+
+    if (url.pathname === "/api/hermes/config" && request.method === "GET") {
+      return Response.json({
+        ok: true,
+        username: hermesUser.username,
+        workerUrl: new URL(request.url).origin,
+        linkMatch: getHermesLinkMatch(env),
+      }, { headers });
+    }
+  }
+
+  // POST /api/logout — invalidate current session token
+  if (url.pathname === "/api/logout" && request.method === "POST") {
+    const auth = request.headers.get("Authorization") || "";
+    if (auth.startsWith("Bearer ")) {
+      await env.DB.prepare("DELETE FROM sessions WHERE token = ?").bind(auth.slice(7)).run();
+    }
+    return Response.json({ ok: true }, { headers });
+  }
+
+  // ── User self-service (logged-in user) ──
+
+  // GET /api/account — my profile, quotas, owned domains
+  if (url.pathname === "/api/account" && request.method === "GET") {
+    const actor = await resolveActor(request, env);
+    if (!actor || !actor.user) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const u = actor.user;
+    const domains = await getUserDomains(env.DB, u.id);
+    return Response.json({
+      username: u.username,
+      dailyLimit: u.daily_limit,
+      hourlyLimit: u.hourly_limit,
+      lifetimeLimit: u.lifetime_limit,
+      domains,
+    }, { headers });
+  }
+
+  // POST /api/account/password — change own password {oldPassword,newPassword}
+  if (url.pathname === "/api/account/password" && request.method === "POST") {
+    const actor = await resolveActor(request, env);
+    if (!actor || !actor.user) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const body = JSON.parse(await request.text()) as { oldPassword?: string; newPassword?: string };
+    if (!body.newPassword || body.newPassword.length < 4) {
+      return Response.json({ error: "新密码至少 4 位" }, { status: 400, headers });
+    }
+    if (!body.oldPassword || actor.user.password_hash !== await sha256Hex(body.oldPassword)) {
+      return Response.json({ error: "原密码错误" }, { status: 401, headers });
+    }
+    await env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ?")
+      .bind(await sha256Hex(body.newPassword), actor.user.id).run();
+    return Response.json({ ok: true }, { headers });
+  }
+
+  // POST /api/account/quota — set own per-domain quotas
+  if (url.pathname === "/api/account/quota" && request.method === "POST") {
+    const actor = await resolveActor(request, env);
+    if (!actor || !actor.user) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const body = JSON.parse(await request.text()) as { dailyLimit?: number; hourlyLimit?: number; lifetimeLimit?: number };
+    const sets: string[] = [];
+    const binds: number[] = [];
+    for (const [key, col] of [["dailyLimit", "daily_limit"], ["hourlyLimit", "hourly_limit"], ["lifetimeLimit", "lifetime_limit"]] as const) {
+      const v = body[key];
+      if (v !== undefined) {
+        const n = parseInt(String(v));
+        if (!n || n < 1) return Response.json({ error: `${key} 必须 >= 1` }, { status: 400, headers });
+        sets.push(`${col} = ?`);
+        binds.push(n);
+      }
+    }
+    if (sets.length) {
+      await env.DB.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, actor.user.id).run();
+    }
+    return Response.json({ ok: true }, { headers });
+  }
+
+  // POST /api/account/domain-toggle — enable/disable one of my own domains
+  if (url.pathname === "/api/account/domain-toggle" && request.method === "POST") {
+    const actor = await resolveActor(request, env);
+    if (!actor || !actor.user) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const body = JSON.parse(await request.text()) as { domain?: string; enabled?: boolean };
+    const domain = (body.domain || "").toLowerCase();
+    if (!domain) return Response.json({ error: "domain required" }, { status: 400, headers });
+    const owner = await getDomainOwner(env.DB, domain);
+    if (!owner || owner.owner_id !== actor.user.id) {
+      return Response.json({ error: "该域名不属于你" }, { status: 403, headers });
+    }
+    await env.DB.prepare("UPDATE domain_owner SET enabled = ? WHERE domain = ?")
+      .bind(body.enabled ? 1 : 0, domain).run();
+    return Response.json({ ok: true }, { headers });
   }
 
   // POST /api/admin/login
   if (url.pathname === "/api/admin/login" && request.method === "POST") {
-    const raw = await request.text();
-    const body = JSON.parse(raw) as { password: string };
+    const body = JSON.parse(await request.text()) as { password: string };
     if (body.password === env.ADMIN_PASSWORD) {
       return Response.json({ ok: true, token: env.ADMIN_PASSWORD }, { headers });
     }
     return Response.json({ error: "密码错误" }, { status: 401, headers });
   }
 
-  // Admin endpoints (auth required)
+  // Admin endpoints (ADMIN_PASSWORD required)
   if (url.pathname.startsWith("/api/admin/")) {
     if (!checkAuth(request, env)) {
       return Response.json({ error: "unauthorized" }, { status: 401, headers });
@@ -399,79 +736,152 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
       const domains = await getDomains(env.DB);
       const domainsPool2 = await getDomainsPool2(env.DB);
       const forwardRules = await getForwardRules(env.DB);
-      const tagRules = await getTagRules(env.DB);
-      const { tagDaily, domainDaily, domainHourly, domainLifetime } = await getLimits(env.DB);
       const siteName = await getConfig(env.DB, "site_name");
       const autoDeleteHours = await getConfig(env.DB, "auto_delete_hours");
       const linkFilter = await getConfig(env.DB, "link_filter");
-      const hasSitePassword = (await getConfig(env.DB, "site_password_hash")) !== "";
       return Response.json({
-        domains, domainsPool2, forwardRules, tagRules,
+        domains, domainsPool2, forwardRules,
         siteName: siteName || "云端接码",
         autoDeleteHours: parseInt(autoDeleteHours) || 24,
         linkFilter: linkFilter || "auth.heygen.com",
-        hasSitePassword,
-        tagDailyLimit: tagDaily,
-        domainDailyLimit: domainDaily,
-        domainHourlyLimit: domainHourly,
-        domainLifetimeLimit: domainLifetime,
       }, { headers });
     }
 
     // POST /api/admin/config
     if (url.pathname === "/api/admin/config" && request.method === "POST") {
-      const raw = await request.text();
-      const body = JSON.parse(raw) as {
+      const body = JSON.parse(await request.text()) as {
         domains?: string[];
         domainsPool2?: string[];
         forwardRules?: ForwardRule[];
-        tagRules?: TagRule[];
         siteName?: string;
         autoDeleteHours?: number;
         linkFilter?: string;
-        sitePassword?: string;
-        clearSitePassword?: boolean;
-        tagDailyLimit?: number;
-        domainDailyLimit?: number;
-        domainHourlyLimit?: number;
-        domainLifetimeLimit?: number;
       };
       if (body.domains !== undefined) await setConfig(env.DB, "domains", JSON.stringify(body.domains));
       if (body.domainsPool2 !== undefined) await setConfig(env.DB, "domains_pool2", JSON.stringify(body.domainsPool2));
       if (body.forwardRules !== undefined) await setConfig(env.DB, "forward_rules", JSON.stringify(body.forwardRules));
-      if (body.tagRules !== undefined) await setConfig(env.DB, "tag_rules", JSON.stringify(body.tagRules));
       if (body.siteName !== undefined) await setConfig(env.DB, "site_name", body.siteName);
       if (body.autoDeleteHours !== undefined) await setConfig(env.DB, "auto_delete_hours", String(body.autoDeleteHours));
       if (body.linkFilter !== undefined) await setConfig(env.DB, "link_filter", body.linkFilter);
-      if (body.tagDailyLimit !== undefined) {
-        const v = parseInt(String(body.tagDailyLimit));
-        if (!v || v < 1) return Response.json({ error: "tagDailyLimit must be >= 1" }, { status: 400, headers });
-        await setConfig(env.DB, "tag_daily_limit", String(v));
+      return Response.json({ ok: true }, { headers });
+    }
+
+    // GET /api/admin/users — list users + their domains
+    if (url.pathname === "/api/admin/users" && request.method === "GET") {
+      const userRows = await env.DB.prepare(
+        "SELECT id, username, is_admin, daily_limit, hourly_limit, lifetime_limit, created_at FROM users ORDER BY created_at ASC"
+      ).all();
+      const domainRows = await env.DB.prepare(
+        "SELECT domain, owner_id, enabled FROM domain_owner ORDER BY domain"
+      ).all();
+      const byOwner: Record<string, { domain: string; enabled: number }[]> = {};
+      for (const r of (domainRows.results || []) as { domain: string; owner_id: string; enabled: number }[]) {
+        (byOwner[r.owner_id] ||= []).push({ domain: r.domain, enabled: r.enabled });
       }
-      if (body.domainDailyLimit !== undefined) {
-        const v = parseInt(String(body.domainDailyLimit));
-        if (!v || v < 1) return Response.json({ error: "domainDailyLimit must be >= 1" }, { status: 400, headers });
-        await setConfig(env.DB, "domain_daily_limit", String(v));
+      const users = ((userRows.results || []) as Record<string, unknown>[]).map((u) => ({
+        id: u.id, username: u.username, isAdmin: u.is_admin,
+        dailyLimit: u.daily_limit, hourlyLimit: u.hourly_limit, lifetimeLimit: u.lifetime_limit,
+        createdAt: u.created_at,
+        domains: byOwner[u.id as string] || [],
+      }));
+      return Response.json({ users }, { headers });
+    }
+
+    // POST /api/admin/users — create a user
+    if (url.pathname === "/api/admin/users" && request.method === "POST") {
+      const body = JSON.parse(await request.text()) as {
+        username?: string; password?: string;
+        dailyLimit?: number; hourlyLimit?: number; lifetimeLimit?: number;
+      };
+      const username = (body.username || "").trim().toLowerCase();
+      if (!username || !body.password) {
+        return Response.json({ error: "用户名和密码必填" }, { status: 400, headers });
       }
-      if (body.domainHourlyLimit !== undefined) {
-        const v = parseInt(String(body.domainHourlyLimit));
-        if (!v || v < 1) return Response.json({ error: "domainHourlyLimit must be >= 1" }, { status: 400, headers });
-        await setConfig(env.DB, "domain_hourly_limit", String(v));
+      if (await getUserByUsername(env.DB, username)) {
+        return Response.json({ error: "用户名已存在" }, { status: 409, headers });
       }
-      if (body.domainLifetimeLimit !== undefined) {
-        const v = parseInt(String(body.domainLifetimeLimit));
-        if (!v || v < 1) return Response.json({ error: "domainLifetimeLimit must be >= 1" }, { status: 400, headers });
-        await setConfig(env.DB, "domain_lifetime_limit", String(v));
+      const id = generateId();
+      await env.DB.prepare(
+        "INSERT INTO users (id, username, password_hash, is_admin, daily_limit, hourly_limit, lifetime_limit, created_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?)"
+      ).bind(
+        id, username, await sha256Hex(body.password),
+        parseInt(String(body.dailyLimit)) || DEFAULT_DAILY_LIMIT,
+        parseInt(String(body.hourlyLimit)) || DEFAULT_HOURLY_LIMIT,
+        parseInt(String(body.lifetimeLimit)) || DEFAULT_LIFETIME_LIMIT,
+        Date.now(),
+      ).run();
+      return Response.json({ ok: true, id }, { headers });
+    }
+
+    // POST /api/admin/users/password — admin reset a user's password
+    if (url.pathname === "/api/admin/users/password" && request.method === "POST") {
+      const body = JSON.parse(await request.text()) as { username?: string; newPassword?: string };
+      const username = (body.username || "").trim().toLowerCase();
+      if (!username || !body.newPassword) {
+        return Response.json({ error: "username and newPassword required" }, { status: 400, headers });
       }
-      if (body.clearSitePassword) await setConfig(env.DB, "site_password_hash", "");
-      if (body.sitePassword) {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(body.sitePassword);
-        const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        const hashHex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-        await setConfig(env.DB, "site_password_hash", hashHex);
+      const user = await getUserByUsername(env.DB, username);
+      if (!user) return Response.json({ error: "用户不存在" }, { status: 404, headers });
+      await env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ?")
+        .bind(await sha256Hex(body.newPassword), user.id).run();
+      return Response.json({ ok: true }, { headers });
+    }
+
+    // DELETE /api/admin/users — delete a user, release domains, orphan their data
+    if (url.pathname === "/api/admin/users" && request.method === "DELETE") {
+      const body = JSON.parse(await request.text()) as { username?: string };
+      const username = (body.username || "").trim().toLowerCase();
+      const user = username ? await getUserByUsername(env.DB, username) : null;
+      if (!user) return Response.json({ error: "用户不存在" }, { status: 404, headers });
+      await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(user.id).run();
+      await env.DB.prepare("UPDATE passwords SET owner_id = NULL WHERE owner_id = ?").bind(user.id).run();
+      await env.DB.prepare("UPDATE emails SET owner_id = NULL WHERE owner_id = ?").bind(user.id).run();
+      await env.DB.prepare("DELETE FROM domain_owner WHERE owner_id = ?").bind(user.id).run();
+      await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(user.id).run();
+      return Response.json({ ok: true }, { headers });
+    }
+
+    // POST /api/admin/assign-domain — assign a configured domain to a user (exclusive)
+    if (url.pathname === "/api/admin/assign-domain" && request.method === "POST") {
+      const body = JSON.parse(await request.text()) as { domain?: string; username?: string; reassign?: boolean };
+      const domain = (body.domain || "").toLowerCase();
+      const username = (body.username || "").trim().toLowerCase();
+      if (!domain || !username) {
+        return Response.json({ error: "domain and username required" }, { status: 400, headers });
       }
+      const configured = await getConfiguredDomains(env.DB);
+      if (!configured.has(domain)) {
+        return Response.json({ error: "域名未在系统配置中（需先在 Cloudflare 配好并加入域名池）" }, { status: 400, headers });
+      }
+      const user = await getUserByUsername(env.DB, username);
+      if (!user) return Response.json({ error: "用户不存在" }, { status: 404, headers });
+      const existing = await getDomainOwner(env.DB, domain);
+      if (existing && existing.owner_id !== user.id && !body.reassign) {
+        return Response.json({ error: "域名已被其他用户占用（传 reassign=true 可改派）" }, { status: 409, headers });
+      }
+      const now = Date.now();
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO domain_owner (domain, owner_id, enabled, assigned_at) VALUES (?, ?, 1, ?)"
+      ).bind(domain, user.id, now).run();
+      // Reattribute this domain's existing mailboxes/emails to the new owner so the
+      // user immediately sees their inbox (no separate manual backfill needed).
+      await env.DB.prepare("UPDATE passwords SET owner_id = ? WHERE domain = ?").bind(user.id, domain).run();
+      await env.DB.prepare(
+        "UPDATE emails SET owner_id = ? WHERE substr(mail_to, instr(mail_to, '@') + 1) = ?"
+      ).bind(user.id, domain).run();
+      return Response.json({ ok: true }, { headers });
+    }
+
+    // POST /api/admin/unassign-domain — remove ownership, orphan that domain's data
+    if (url.pathname === "/api/admin/unassign-domain" && request.method === "POST") {
+      const body = JSON.parse(await request.text()) as { domain?: string };
+      const domain = (body.domain || "").toLowerCase();
+      if (!domain) return Response.json({ error: "domain required" }, { status: 400, headers });
+      await env.DB.prepare("DELETE FROM domain_owner WHERE domain = ?").bind(domain).run();
+      await env.DB.prepare("UPDATE passwords SET owner_id = NULL WHERE domain = ?").bind(domain).run();
+      await env.DB.prepare(
+        "UPDATE emails SET owner_id = NULL WHERE substr(mail_to, instr(mail_to, '@') + 1) = ?"
+      ).bind(domain).run();
       return Response.json({ ok: true }, { headers });
     }
 
@@ -487,6 +897,27 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
       }, { headers });
     }
 
+    // GET /api/admin/emails — search across all users (exact address or substring)
+    if (url.pathname === "/api/admin/emails" && request.method === "GET") {
+      const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+      const address = (url.searchParams.get("address") || "").toLowerCase();
+      if (q) {
+        if (q.length < 3) return Response.json({ error: "查询关键字至少 3 个字符" }, { status: 400, headers });
+        const escaped = q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+        const result = await env.DB.prepare(
+          "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body as text, html_body as html, timestamp FROM emails WHERE mail_to LIKE ? ESCAPE '\\' ORDER BY timestamp DESC LIMIT 50"
+        ).bind(`%${escaped}%`).all();
+        return Response.json({ emails: result.results || [] }, { headers });
+      }
+      if (address) {
+        const result = await env.DB.prepare(
+          "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body as text, html_body as html, timestamp FROM emails WHERE mail_to = ? ORDER BY timestamp DESC LIMIT 50"
+        ).bind(address).all();
+        return Response.json({ emails: result.results || [] }, { headers });
+      }
+      return Response.json({ error: "address or q required" }, { status: 400, headers });
+    }
+
     // DELETE /api/admin/emails
     if (url.pathname === "/api/admin/emails" && request.method === "DELETE") {
       await env.DB.prepare("DELETE FROM emails").run();
@@ -494,14 +925,27 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  // ── Password Manager endpoints ──
+  // ── Mailbox / inbox endpoints (logged-in user; admin may scope via ?username) ──
 
-  // GET /api/passwords?tag=ck&page=1&limit=50&start=timestamp&end=timestamp&linkStart=timestamp&linkEnd=timestamp
-  if (url.pathname === "/api/passwords" && request.method === "GET") {
-    if (!await checkAuthFull(request, env)) {
-      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+  // Resolve the owner scope for a request: user → own id; admin → ?username or all.
+  // Returns { ownerId: string | null, all: boolean } or null when unauthorized.
+  async function ownerScope(): Promise<{ ownerId: string | null; all: boolean } | null> {
+    const actor = await resolveActor(request, env);
+    if (!actor) return null;
+    if (actor.user) return { ownerId: actor.user.id, all: false };
+    // admin
+    const username = (url.searchParams.get("username") || "").trim().toLowerCase();
+    if (username) {
+      const u = await getUserByUsername(env.DB, username);
+      return { ownerId: u ? u.id : " __none__", all: false };
     }
-    const tag = url.searchParams.get("tag") || "";
+    return { ownerId: null, all: true };
+  }
+
+  // GET /api/passwords — list this owner's confirmed mailboxes
+  if (url.pathname === "/api/passwords" && request.method === "GET") {
+    const scope = await ownerScope();
+    if (!scope) return Response.json({ error: "unauthorized" }, { status: 401, headers });
     const page = Math.max(1, parseInt(url.searchParams.get("page") || "1"));
     const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get("limit") || "50")));
     const start = url.searchParams.get("start") || "";
@@ -509,131 +953,135 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const linkDays = url.searchParams.get("linkDays") || "";
     const offset = (page - 1) * limit;
 
-    let where = tag ? "WHERE confirmed = 1 AND (label = ? OR address LIKE ?)" : "WHERE confirmed = 1";
-    const binds: (string | number)[] = tag ? [tag, `%-${tag}@%`] : [];
+    let where = "WHERE confirmed = 1";
+    const binds: (string | number)[] = [];
+    if (!scope.all) { where += " AND owner_id = ?"; binds.push(scope.ownerId as string); }
     if (start) { where += " AND created_at >= ?"; binds.push(parseInt(start)); }
     if (end) { where += " AND created_at <= ?"; binds.push(parseInt(end)); }
     if (linkDays) {
       const cutoff = Date.now() - parseInt(linkDays) * 86400000;
-      where += " AND (last_link_received_at IS NULL OR last_link_received_at <= ?)";
+      where += " AND last_link_received_at IS NOT NULL AND last_link_received_at <= ?";
       binds.push(cutoff);
     }
 
     const countRow = await env.DB.prepare(`SELECT COUNT(*) as total FROM passwords ${where}`).bind(...binds).first() as { total: number } | null;
     const total = countRow?.total || 0;
-
     const rows = await env.DB.prepare(
       `SELECT address, password, label, created_at, updated_at, last_link_received_at FROM passwords ${where} ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ? OFFSET ?`
     ).bind(...binds, limit, offset).all();
-
     return Response.json({ passwords: rows.results || [], total, page, limit }, { headers });
   }
 
-  // POST /api/passwords — reserve a password for a new address
-  // When called from the generate button, saves as confirmed=0 (no quota consumed, hidden from list).
-  // confirmed=1 is set only when the first email arrives.
+  // POST /api/passwords — reserve a mailbox (confirmed=0, no quota consumed yet)
   if (url.pathname === "/api/passwords" && request.method === "POST") {
-    if (!await checkAuthFull(request, env)) {
-      return Response.json({ error: "unauthorized" }, { status: 401, headers });
-    }
-    const raw = await request.text();
-    const body = JSON.parse(raw) as { address: string; password: string; label?: string };
+    const actor = await resolveActor(request, env);
+    if (!actor) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const body = JSON.parse(await request.text()) as { address: string; password: string };
     if (!body.address || !body.password) {
       return Response.json({ error: "address and password required" }, { status: 400, headers });
     }
     const address = body.address.toLowerCase();
     const addrDomain = address.includes("@") ? address.slice(address.indexOf("@") + 1) : "";
-    const [existingPassword, existingEmail, lifetimeUsed, { domainLifetime }] = await Promise.all([
+    const owner = await getDomainOwner(env.DB, addrDomain);
+
+    // A user may only reserve on a domain they own and have enabled.
+    if (actor.user) {
+      if (!owner || owner.owner_id !== actor.user.id) {
+        return Response.json({ error: "该域名不属于你" }, { status: 403, headers });
+      }
+      if (!owner.enabled) {
+        return Response.json({ error: "该域名已被你停用" }, { status: 403, headers });
+      }
+    }
+
+    const ownerId = owner?.owner_id || null;
+    const limitUser = actor.user ?? (ownerId ? await getUserById(env.DB, ownerId) : null);
+    const lifetimeLimit = limitUser?.lifetime_limit ?? DEFAULT_LIFETIME_LIMIT;
+
+    const [existingPassword, existingEmail, lifetimeUsed] = await Promise.all([
       env.DB.prepare("SELECT address FROM passwords WHERE address = ? LIMIT 1").bind(address).first(),
       env.DB.prepare("SELECT mail_to FROM emails WHERE mail_to = ? LIMIT 1").bind(address).first(),
       getDomainLifetimeUsed(env.DB, addrDomain),
-      getLimits(env.DB),
     ]);
     if (existingPassword || existingEmail) {
       return Response.json({ error: "address already exists" }, { status: 409, headers });
     }
-    if (lifetimeUsed >= domainLifetime) {
+    if (lifetimeUsed >= lifetimeLimit) {
       return Response.json({ error: "domain lifetime quota exceeded" }, { status: 429, headers });
     }
     const now = Date.now();
-    // Save as unconfirmed (confirmed=0); quota is checked and consumed only when email arrives
+    // Saved as unconfirmed; quota is consumed only when an email arrives (confirmed=1).
     await env.DB.prepare(
-      "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain) VALUES (?, ?, ?, 0, ?, ?, ?)"
-    ).bind(address, body.password, body.label || "", now, now, addrDomain).run();
+      "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain, owner_id) VALUES (?, ?, '', 0, ?, ?, ?, ?)"
+    ).bind(address, body.password, now, now, addrDomain, ownerId).run();
     return Response.json({ ok: true }, { headers });
   }
 
-  // DELETE /api/passwords — remove an address entry (admin only)
+  // DELETE /api/passwords — remove a mailbox (own, or admin any)
   if (url.pathname === "/api/passwords" && request.method === "DELETE") {
-    if (!await checkAuthFull(request, env)) {
+    const actor = await resolveActor(request, env);
+    if (!actor) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const body = JSON.parse(await request.text()) as { address: string };
+    const address = body.address.toLowerCase();
+    if (actor.user) {
+      await env.DB.prepare("DELETE FROM passwords WHERE address = ? AND owner_id = ?").bind(address, actor.user.id).run();
+    } else {
+      await env.DB.prepare("DELETE FROM passwords WHERE address = ?").bind(address).run();
+    }
+    return Response.json({ ok: true }, { headers });
+  }
+
+  // GET /api/inbox — this owner's received emails (metadata + activation link).
+  // Optional ?address= (exact) or ?q= (substring >=3) narrows within the owner's
+  // own mail only — owner_id equality keeps it indexed (idx_emails_owner_ts); the
+  // optional mail_to filter runs over just this user's rows, not a global scan.
+  if (url.pathname === "/api/inbox" && request.method === "GET") {
+    const scope = await ownerScope();
+    if (!scope || scope.all || !scope.ownerId) {
       return Response.json({ error: "unauthorized" }, { status: 401, headers });
     }
-    const raw = await request.text();
-    const body = JSON.parse(raw) as { address: string };
-    await env.DB.prepare("DELETE FROM passwords WHERE address = ?").bind(body.address.toLowerCase()).run();
-    return Response.json({ ok: true }, { headers });
-  }
-
-  // GET /api/tag-emails?tag=ck — metadata + activation link (supports both new label-based and old dash-tag format)
-  if (url.pathname === "/api/tag-emails" && request.method === "GET") {
-    const tag = (url.searchParams.get("tag") || "").toLowerCase();
-    if (!tag) return Response.json({ error: "tag required" }, { status: 400, headers });
-
-    // Tag denormalized onto emails.label — single indexed lookup (idx_emails_label_ts)
+    const address = (url.searchParams.get("address") || "").toLowerCase();
+    const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+    let where = "WHERE owner_id = ?";
+    const binds: (string | number)[] = [scope.ownerId];
+    if (address) {
+      where += " AND mail_to = ?";
+      binds.push(address);
+    } else if (q) {
+      if (q.length < 3) return Response.json({ error: "查询关键字至少 3 个字符" }, { status: 400, headers });
+      const escaped = q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+      where += " AND mail_to LIKE ? ESCAPE '\\'";
+      binds.push(`%${escaped}%`);
+    }
     const rows = await env.DB.prepare(
-      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails WHERE label = ? ORDER BY timestamp DESC LIMIT ?"
-    ).bind(tag, EMAIL_LIST_LIMIT).all();
-    const merged = (rows.results || []) as Record<string, unknown>[];
-
+      `SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails ${where} ORDER BY timestamp DESC LIMIT ?`
+    ).bind(...binds, EMAIL_LIST_LIMIT).all();
     const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
-    const emails = merged.map((row: Record<string, unknown>) => {
-      const content = ((row.html_body as string) || "") + " " + ((row.text_body as string) || "");
-      const m = content.match(/https:\/\/auth\.heygen\.com\/[^\s"'<>)]+/);
-      return {
-        id: row.id, to: row.to, from: row.from, subject: row.subject, timestamp: row.timestamp,
-        activationLink: m ? m[0].replace(/[.,;!?]+$/, "") : null,
-      };
-    });
+    const emails = ((rows.results || []) as Record<string, unknown>[]).map((row) => ({
+      id: row.id, to: row.to, from: row.from, subject: row.subject, timestamp: row.timestamp,
+      activationLink: extractActivationLink(row.html_body as string, row.text_body as string, linkFilter),
+    }));
     return Response.json({ emails }, { headers });
   }
 
-  // GET /api/all-emails — metadata + activation link for all received emails
-  if (url.pathname === "/api/all-emails" && request.method === "GET") {
-    const rows = await env.DB.prepare(
-      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body, html_body, timestamp FROM emails ORDER BY timestamp DESC LIMIT ?"
-    ).bind(EMAIL_LIST_LIMIT).all();
-
-    const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
-    const emails = ((rows.results || []) as Record<string, unknown>[]).map((row) => {
-      const content = ((row.html_body as string) || "") + " " + ((row.text_body as string) || "");
-      let activationLink: string | null = null;
-      if (linkFilter) {
-        const re = /https?:\/\/[^\s"'<>)]+/g;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(content)) !== null) {
-          if (m[0].includes(linkFilter)) { activationLink = m[0].replace(/[.,;!?]+$/, ""); break; }
-        }
-      }
-      return {
-        id: row.id, to: row.to, from: row.from, subject: row.subject, timestamp: row.timestamp,
-        activationLink,
-      };
-    });
-    return Response.json({ emails }, { headers });
-  }
-
-  // GET /api/email-detail?id=xxx — full email content (html + text) on demand
+  // GET /api/email-detail?id=xxx — full email; user may only read own, admin any
   if (url.pathname === "/api/email-detail" && request.method === "GET") {
+    const actor = await resolveActor(request, env);
+    if (!actor) return Response.json({ error: "unauthorized" }, { status: 401, headers });
     const id = url.searchParams.get("id") || "";
     if (!id) return Response.json({ error: "id required" }, { status: 400, headers });
     const row = await env.DB.prepare(
-      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body as text, html_body as html, timestamp FROM emails WHERE id = ?"
-    ).bind(id).first();
+      "SELECT id, mail_to as 'to', mail_from as 'from', subject, text_body as text, html_body as html, timestamp, owner_id FROM emails WHERE id = ?"
+    ).bind(id).first() as Record<string, unknown> | null;
     if (!row) return Response.json({ error: "not found" }, { status: 404, headers });
+    if (actor.user && row.owner_id !== actor.user.id) {
+      return Response.json({ error: "unauthorized" }, { status: 403, headers });
+    }
+    delete row.owner_id;
     return Response.json({ email: row }, { headers });
   }
 
-  // POST /api/generate-address — generate + register a new address for a profile
+  // POST /api/generate-address — admin automation: generate + register for a profile
   if (url.pathname === "/api/generate-address" && request.method === "POST") {
     if (!checkAuth(request, env)) return Response.json({ error: "unauthorized" }, { status: 401, headers });
     const body = await request.json() as { profile_id: string };
@@ -654,34 +1102,42 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const usedDomains = new Set(
       (usedRows.results || []).map((r: Record<string, unknown>) => (r.address as string).split("@")[1])
     );
-    // Prefer unused domains; fall back to all domains if all are used
     const preferredDomains = allDomains.filter(d => !usedDomains.has(d));
     const candidateDomains = preferredDomains.length > 0 ? preferredDomains : allDomains;
 
-    // Filter out domains that have reached lifetime quota
-    const { domainLifetime } = await getLimits(env.DB);
+    // Per-domain lifetime limit = owner's limit if owned, else default.
+    const ownerRows = await env.DB.prepare(
+      "SELECT do.domain as domain, do.owner_id as owner_id, u.lifetime_limit as lifetime_limit FROM domain_owner do JOIN users u ON u.id = do.owner_id"
+    ).all();
+    const ownerByDomain = new Map<string, { ownerId: string; lifetime: number }>();
+    for (const r of (ownerRows.results || []) as { domain: string; owner_id: string; lifetime_limit: number }[]) {
+      ownerByDomain.set(r.domain.toLowerCase(), { ownerId: r.owner_id, lifetime: r.lifetime_limit });
+    }
     const lifetimeCounts = await Promise.all(
       candidateDomains.map(d => getDomainLifetimeUsed(env.DB, d).then(count => ({ d, count })))
     );
-    const domains = lifetimeCounts.filter(({ count }) => count < domainLifetime).map(({ d }) => d);
+    const domains = lifetimeCounts
+      .filter(({ d, count }) => count < (ownerByDomain.get(d.toLowerCase())?.lifetime ?? DEFAULT_LIFETIME_LIMIT))
+      .map(({ d }) => d);
     if (!domains.length) return Response.json({ error: "all domains have reached lifetime quota" }, { status: 429, headers });
 
     let address = "";
+    let chosenDomain = "";
     for (let i = 0; i < 10; i++) {
       const name = NAMES[Math.floor(Math.random() * NAMES.length)];
       const num = Math.floor(Math.random() * 900) + 10;
       const domain = domains[Math.floor(Math.random() * domains.length)];
       const candidate = `${name}${num}@${domain}`;
       const existing = await env.DB.prepare("SELECT address FROM passwords WHERE address = ?").bind(candidate).first();
-      if (!existing) { address = candidate; break; }
+      if (!existing) { address = candidate; chosenDomain = domain; break; }
     }
     if (!address) return Response.json({ error: "could not generate unique address" }, { status: 500, headers });
 
     const now = Date.now();
-    const domain = address.split("@")[1];
+    const ownerId = ownerByDomain.get(chosenDomain.toLowerCase())?.ownerId || null;
     await env.DB.prepare(
-      "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain) VALUES (?, ?, ?, 0, ?, ?, ?)"
-    ).bind(address, generatePassword(), "", now, now, domain).run();
+      "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain, owner_id) VALUES (?, ?, '', 0, ?, ?, ?, ?)"
+    ).bind(address, generatePassword(), now, now, chosenDomain, ownerId).run();
     await env.DB.prepare(
       "INSERT OR REPLACE INTO profile_addresses (address, profile_id, assigned_at) VALUES (?, ?, ?)"
     ).bind(address, body.profile_id, now).run();
@@ -690,7 +1146,6 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
   }
 
   // POST /api/profile-address — assign addresses to a profile (admin only)
-  // body: { profile_id, addresses: string[] }
   if (url.pathname === "/api/profile-address" && request.method === "POST") {
     if (!checkAuth(request, env)) return Response.json({ error: "unauthorized" }, { status: 401, headers });
     const body = await request.json() as { profile_id: string; addresses: string[] };
@@ -706,7 +1161,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true }, { headers });
   }
 
-  // GET /api/profile-address?profile_id=xxx — get addresses assigned to a profile
+  // GET /api/profile-address?profile_id=xxx — addresses assigned to a profile
   if (url.pathname === "/api/profile-address" && request.method === "GET") {
     const profileId = url.searchParams.get("profile_id") || "";
     if (!profileId) return Response.json({ error: "profile_id required" }, { status: 400, headers });
@@ -732,7 +1187,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true, id }, { headers });
   }
 
-  // GET /api/activation-link?profile_id=xxx — poll for pending links (no auth, profile_id is the token)
+  // GET /api/activation-link?profile_id=xxx — poll for pending links (profile_id is the token)
   if (url.pathname === "/api/activation-link" && request.method === "GET") {
     const profileId = url.searchParams.get("profile_id") || "";
     if (!profileId) return Response.json({ error: "profile_id required" }, { status: 400, headers });
@@ -749,97 +1204,25 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true }, { headers });
   }
 
-  // GET /api/domain-quota?domain=xxx — single domain quota (kept for backwards compat)
-  if (url.pathname === "/api/domain-quota" && request.method === "GET") {
-    const domain = (url.searchParams.get("domain") || "").toLowerCase();
-    if (!domain) return Response.json({ error: "domain required" }, { status: 400, headers });
-    const todayStart = new Date();
-    todayStart.setUTCHours(0, 0, 0, 0);
-    const result = await env.DB.prepare(
-      "SELECT COUNT(*) as count FROM passwords WHERE domain = ? AND created_at >= ?"
-    ).bind(domain, todayStart.getTime()).first() as { count: number } | null;
-    const used = result?.count || 0;
-    const { domainDaily } = await getLimits(env.DB);
-    const limit = domainDaily;
-    return Response.json({ domain, used, limit, remaining: Math.max(0, limit - used) }, { headers });
-  }
-
-  // GET /api/domain-quotas — batch: hourly + daily counts for all domains
+  // GET /api/domain-quotas — this user's per-domain hourly/daily/lifetime usage + limits
   if (url.pathname === "/api/domain-quotas" && request.method === "GET") {
-    const now = new Date();
-    const todayStart = new Date(now);
-    todayStart.setUTCHours(0, 0, 0, 0);
-    const hourStart = new Date(now);
-    hourStart.setMinutes(0, 0, 0);
-
-    const [dailyRows, hourlyRows, lifetimeRows] = await Promise.all([
-      env.DB.prepare(
-        "SELECT domain, COUNT(*) as count FROM passwords WHERE confirmed = 1 AND created_at >= ? AND domain IS NOT NULL GROUP BY domain"
-      ).bind(todayStart.getTime()).all(),
-      env.DB.prepare(
-        "SELECT domain, COUNT(*) as count FROM passwords WHERE confirmed = 1 AND created_at >= ? AND domain IS NOT NULL GROUP BY domain"
-      ).bind(hourStart.getTime()).all(),
-      env.DB.prepare(
-        "SELECT domain, COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain IS NOT NULL GROUP BY domain"
-      ).all(),
-    ]);
-
+    const actor = await resolveActor(request, env);
+    if (!actor || !actor.user) return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    const u = actor.user;
+    const userDomains = await getUserDomains(env.DB, u.id);
     const daily: Record<string, number> = {};
     const hourly: Record<string, number> = {};
     const lifetime: Record<string, number> = {};
-    for (const r of (dailyRows.results || []) as { domain: string; count: number }[]) daily[r.domain] = r.count;
-    for (const r of (hourlyRows.results || []) as { domain: string; count: number }[]) hourly[r.domain] = r.count;
-    for (const r of (lifetimeRows.results || []) as { domain: string; count: number }[]) lifetime[r.domain] = r.count;
-
-    const { domainDaily, domainHourly, domainLifetime } = await getLimits(env.DB);
-    return Response.json({ daily, hourly, lifetime, hourlyLimit: domainHourly, dailyLimit: domainDaily, lifetimeLimit: domainLifetime }, { headers });
-  }
-
-  // GET /api/tag-quota?label=xxx — confirmed (received email) addresses for a tag today (resets 23:30 ET)
-  if (url.pathname === "/api/tag-quota" && request.method === "GET") {
-    const label = (url.searchParams.get("label") || "").toLowerCase();
-    if (!label) return Response.json({ error: "label required" }, { status: 400, headers });
-    const resetTs = getLastEasternReset();
-    const result = await env.DB.prepare(
-      "SELECT COUNT(*) as count FROM passwords WHERE label = ? AND confirmed = 1 AND created_at >= ?"
-    ).bind(label, resetTs).first() as { count: number } | null;
-    const used = result?.count || 0;
-    const { tagDaily } = await getLimits(env.DB);
+    const enabled: Record<string, boolean> = {};
+    await Promise.all(userDomains.map(async ({ domain, enabled: en }) => {
+      const c = await getDomainCounts(env.DB, domain);
+      daily[domain] = c.daily; hourly[domain] = c.hourly; lifetime[domain] = c.lifetime;
+      enabled[domain] = !!en;
+    }));
     return Response.json({
-      label, used, limit: tagDaily, remaining: Math.max(0, tagDaily - used),
+      daily, hourly, lifetime, enabled,
+      hourlyLimit: u.hourly_limit, dailyLimit: u.daily_limit, lifetimeLimit: u.lifetime_limit,
     }, { headers });
-  }
-
-  // GET /api/tags — public, returns tag rules for frontend display
-  if (url.pathname === "/api/tags" && request.method === "GET") {
-    const tagRules = await getTagRules(env.DB);
-    return Response.json({ tagRules }, { headers });
-  }
-
-  // POST /api/tags — site-password protected, allows frontend users to manage tags
-  if (url.pathname === "/api/tags" && request.method === "POST") {
-    const raw = await request.text();
-    const body = JSON.parse(raw) as { password?: string; tagRules?: TagRule[] };
-
-    // Accept either site password or admin password
-    const siteHash = await getConfig(env.DB, "site_password_hash");
-    let authed = false;
-    if (body.password === env.ADMIN_PASSWORD) {
-      authed = true;
-    } else if (siteHash && body.password) {
-      const encoder = new TextEncoder();
-      const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(body.password));
-      const hashHex = Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
-      authed = hashHex === siteHash;
-    }
-    if (!authed) {
-      return Response.json({ error: "密码错误" }, { status: 401, headers });
-    }
-
-    if (body.tagRules !== undefined) {
-      await setConfig(env.DB, "tag_rules", JSON.stringify(body.tagRules));
-    }
-    return Response.json({ ok: true }, { headers });
   }
 
   // Cleanup
@@ -851,11 +1234,13 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true }, { headers });
   }
 
-  // GET /api/stream?tag=xxx&since=timestamp — SSE push for new emails
+  // GET /api/stream?token=xxx&since=timestamp — SSE push for this user's new emails
   if (url.pathname === "/api/stream" && request.method === "GET") {
-    const tag = (url.searchParams.get("tag") || "").toLowerCase();
-    if (!tag) return Response.json({ error: "tag required" }, { status: 400, headers });
-
+    const actor = await resolveActorByToken(env, url.searchParams.get("token") || "");
+    if (!actor || !actor.user) {
+      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    }
+    const ownerId = actor.user.id;
     const since = parseInt(url.searchParams.get("since") || "0") || (Date.now() - 5000);
     const encoder = new TextEncoder();
     let closed = false;
@@ -863,7 +1248,6 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const stream = new ReadableStream({
       async start(controller) {
         let lastTs = since;
-
         const send = (data: object): boolean => {
           if (closed) return false;
           try {
@@ -878,27 +1262,17 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
         while (!closed) {
           await new Promise<void>(r => setTimeout(r, STREAM_POLL_MS));
           if (closed) break;
-
           try {
             const rows = await env.DB.prepare(
               "SELECT id, mail_to as 'to', mail_from as 'from', subject, html_body, text_body, timestamp " +
-              "FROM emails WHERE label = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT 10"
-            ).bind(tag, lastTs).all();
+              "FROM emails WHERE owner_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT 10"
+            ).bind(ownerId, lastTs).all();
 
             for (const row of (rows.results || []) as Record<string, unknown>[]) {
-              const content = ((row.html_body as string) || "") + " " + ((row.text_body as string) || "");
-              let activationLink: string | null = null;
-              if (linkFilter) {
-                const re = /https?:\/\/[^\s"'<>)]+/g;
-                let m: RegExpExecArray | null;
-                while ((m = re.exec(content)) !== null) {
-                  if (m[0].includes(linkFilter)) { activationLink = m[0].replace(/[.,;!?]+$/, ""); break; }
-                }
-              }
+              const activationLink = extractActivationLink(row.html_body as string, row.text_body as string, linkFilter);
               if (!send({ type: "email", email: { id: row.id, to: row.to, from: row.from, subject: row.subject, timestamp: row.timestamp, activationLink } })) break;
               if ((row.timestamp as number) > lastTs) lastTs = row.timestamp as number;
             }
-
             send({ type: "ping" });
           } catch { break; }
         }
@@ -924,160 +1298,82 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 export default {
   async email(message: ForwardableEmailMessage, env: Env): Promise<void> {
     const to = message.to.toLowerCase();
-    const [localPart, domain] = to.split("@");
-    const { tagDaily, domainDaily, domainHourly, domainLifetime } = await getLimits(env.DB);
+    const domain = to.split("@")[1];
 
-    const [domains, domainsPool2, forwardRules, tagRules] = await Promise.all([
-      getDomains(env.DB),
-      getDomainsPool2(env.DB),
+    const [configured, forwardRules] = await Promise.all([
+      getConfiguredDomains(env.DB),
       getForwardRules(env.DB),
-      getTagRules(env.DB),
     ]);
-
-    const knownTags = tagRules.map((r) => r.tag.toLowerCase());
-
-    const allDomains = [
-      ...domains.map((d) => d.toLowerCase()),
-      ...domainsPool2.map((d) => d.toLowerCase()),
-      ...forwardRules.map((r) => r.subdomain.toLowerCase()),
-    ];
-    if (!allDomains.includes(domain)) {
+    if (!configured.has(domain)) {
       message.setReject("Unknown domain");
       return;
     }
 
-    // Forward by subdomain rule
+    // Forward by subdomain rule (domain-level forwarding)
     const subdomainRule = forwardRules.find((r) => r.subdomain.toLowerCase() === domain);
     if (subdomainRule && subdomainRule.target) {
       try { await message.forward(subdomainRule.target); } catch { /* ignore forward failure */ }
     }
 
+    // Only mailboxes we generated (pre-registered) receive mail. Tags are retired,
+    // so there is no auto-create path for arbitrary catch-all addresses.
+    const preRegistered = await env.DB.prepare(
+      "SELECT address, confirmed, owner_id FROM passwords WHERE address = ?"
+    ).bind(to).first() as { address: string; confirmed: number; owner_id: string | null } | null;
+    if (!preRegistered) return;
+
+    const ownerRow = await getDomainOwner(env.DB, domain);
+    const ownerId = ownerRow?.owner_id || null;
+    const owner = ownerId ? await getUserById(env.DB, ownerId) : null;
+
     const rawEmail = await streamToText(message.raw);
     const { subject, textBody, htmlBody } = parseEmailContent(rawEmail);
     const now = Date.now();
 
-    // Determine tag: first check if address was pre-registered (new format, tag in label)
-    // then fall back to dash-tag parsing (old format)
-    const preRegistered = await env.DB.prepare(
-      "SELECT address, label, confirmed FROM passwords WHERE address = ?"
-    ).bind(to).first() as { address: string; label: string; confirmed: number } | null;
-
-    let tag: string | null = null;
-    let accountAddress: string = to;
-
-    if (preRegistered) {
-      // New format: address stored cleanly, tag in label
-      tag = preRegistered.label || null;
-      accountAddress = to;
-    } else {
-      // Old format: tag embedded in address as -tag
-      const parsed = parseDashTag(localPart, knownTags);
-      tag = parsed.tag;
-      accountAddress = tag ? `${parsed.local}-${tag}@${domain}` : to;
-    }
-
-    // Forward by tag rule
-    if (tag) {
-      const tagRule = tagRules.find((r) => r.tag.toLowerCase() === tag);
-      if (tagRule && tagRule.target) {
-        try { await message.forward(tagRule.target); } catch { /* ignore forward failure */ }
-      }
-    }
-
-    // Drop emails to unknown tagless addresses (no tag + not pre-registered)
-    if (!tag && !preRegistered) return;
-
-    // On first email: confirm the address (quota is consumed here, not at generation time)
-    if (preRegistered) {
-      if (!preRegistered.confirmed) {
-        // First email for this address — enforce tag daily quota and domain lifetime quota before confirming
-        if (tag) {
-          const resetTs = getLastEasternReset();
-          const tagCount = await env.DB.prepare(
-            "SELECT COUNT(*) as count FROM passwords WHERE label = ? AND confirmed = 1 AND created_at >= ?"
-          ).bind(tag, resetTs).first() as { count: number } | null;
-          if ((tagCount?.count || 0) >= tagDaily) return; // quota full, drop email silently
+    if (!preRegistered.confirmed) {
+      // First email confirms the mailbox. Quota is enforced here (per the owner's
+      // limits) — hourly + daily + lifetime, all counted on confirmed=1 addresses.
+      if (owner) {
+        const c = await getDomainCounts(env.DB, domain);
+        if (c.hourly >= owner.hourly_limit || c.daily >= owner.daily_limit || c.lifetime >= owner.lifetime_limit) {
+          return; // quota full → drop silently (no quota consumed, no email stored)
         }
-        if ((await getDomainLifetimeUsed(env.DB, domain)) >= domainLifetime) return;
-        await env.DB.prepare(
-          "UPDATE passwords SET confirmed = 1, updated_at = ? WHERE address = ?"
-        ).bind(now, accountAddress).run();
-      } else {
-        await env.DB.prepare(
-          "UPDATE passwords SET updated_at = ? WHERE address = ?"
-        ).bind(now, accountAddress).run();
       }
+      await env.DB.prepare(
+        "UPDATE passwords SET confirmed = 1, owner_id = ?, updated_at = ? WHERE address = ?"
+      ).bind(ownerId, now, to).run();
     } else {
-      const existing = await env.DB.prepare(
-        "SELECT address, confirmed FROM passwords WHERE address = ?"
-      ).bind(accountAddress).first() as { address: string; confirmed: number } | null;
-      if (existing) {
-        if (!existing.confirmed) {
-          // First email — enforce tag quota and domain lifetime quota
-          if (tag) {
-            const resetTs = getLastEasternReset();
-            const tagCount = await env.DB.prepare(
-              "SELECT COUNT(*) as count FROM passwords WHERE label = ? AND confirmed = 1 AND created_at >= ?"
-            ).bind(tag, resetTs).first() as { count: number } | null;
-            if ((tagCount?.count || 0) >= tagDaily) return;
-          }
-          if ((await getDomainLifetimeUsed(env.DB, domain)) >= domainLifetime) return;
-          await env.DB.prepare(
-            "UPDATE passwords SET confirmed = 1, updated_at = ? WHERE address = ?"
-          ).bind(now, accountAddress).run();
-        } else {
-          await env.DB.prepare(
-            "UPDATE passwords SET updated_at = ? WHERE address = ?"
-          ).bind(now, accountAddress).run();
-        }
-      } else {
-        // Old-format dash-tag fallback: enforce domain quota then auto-create as confirmed
-        const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
-        const hourStart = new Date(); hourStart.setMinutes(0, 0, 0);
-        const [dailyRow, hourlyRow, lifetimeUsed] = await Promise.all([
-          env.DB.prepare("SELECT COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain = ? AND created_at >= ?").bind(domain, todayStart.getTime()).first() as Promise<{ count: number } | null>,
-          env.DB.prepare("SELECT COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain = ? AND created_at >= ?").bind(domain, hourStart.getTime()).first() as Promise<{ count: number } | null>,
-          getDomainLifetimeUsed(env.DB, domain),
-        ]);
-        if ((dailyRow?.count || 0) >= domainDaily || (hourlyRow?.count || 0) >= domainHourly || lifetimeUsed >= domainLifetime) return;
-        await env.DB.prepare(
-          "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain) VALUES (?, ?, ?, 1, ?, ?, ?)"
-        ).bind(accountAddress, generatePassword(), tag, now, now, domain).run();
-      }
+      // Already confirmed; just refresh updated_at and backfill owner_id if missing.
+      await env.DB.prepare(
+        "UPDATE passwords SET updated_at = ?, owner_id = COALESCE(owner_id, ?) WHERE address = ?"
+      ).bind(now, ownerId, to).run();
     }
 
-    // Save email to inbox
+    // Store the email (denormalized owner_id → indexed inbox reads, no JOIN/LIKE)
     await env.DB.prepare(
-      "INSERT INTO emails (id, mail_to, mail_from, subject, text_body, html_body, timestamp, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).bind(generateId(), accountAddress, message.from, subject, textBody, htmlBody, now, tag).run();
+      "INSERT INTO emails (id, mail_to, mail_from, subject, text_body, html_body, timestamp, owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(generateId(), to, message.from, subject, textBody, htmlBody, now, ownerId).run();
 
-    // Update last_link_received_at if email contains a link matching linkFilter
+    // Record activation-link receipt + push to profile automation if applicable
     const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
-    if (linkFilter) {
-      const content = htmlBody + textBody;
-      const re = /https?:\/\/[^\s"'<>)]+/g;
-      let m: RegExpExecArray | null;
-      let hasMatch = false;
-      while ((m = re.exec(content)) !== null) {
-        if (m[0].includes(linkFilter)) { hasMatch = true; break; }
-      }
-      if (hasMatch) {
-        await env.DB.prepare(
-          "UPDATE passwords SET last_link_received_at = ? WHERE address = ?"
-        ).bind(now, accountAddress).run();
+    const uiLink = extractActivationLink(htmlBody, textBody, linkFilter);
+    const hermesLink = extractFirstMatchingLink(htmlBody, textBody, getHermesLinkMatches(env));
+    if (uiLink || hermesLink) {
+      await env.DB.prepare(
+        "UPDATE passwords SET last_link_received_at = ? WHERE address = ?"
+      ).bind(now, to).run();
 
-        // Auto-push activation link to profile if address is assigned
-        const profileRow = await env.DB.prepare(
-          "SELECT profile_id FROM profile_addresses WHERE address = ?"
-        ).bind(accountAddress).first() as { profile_id: string } | null;
-        if (profileRow) {
-          const linkMatch = content.match(/https?:\/\/[^\s"'<>)]+/g)
-            ?.find(u => u.includes(linkFilter));
-          if (linkMatch) {
-            await env.DB.prepare(
-              "INSERT INTO activation_links (id, profile_id, url, created_at, consumed) VALUES (?, ?, ?, ?, 0)"
-            ).bind(generateId(), profileRow.profile_id, linkMatch.replace(/[.,;]+$/, ""), now).run();
-          }
+      const profileRow = await env.DB.prepare(
+        "SELECT profile_id FROM profile_addresses WHERE address = ?"
+      ).bind(to).first() as { profile_id: string } | null;
+      if (profileRow && hermesLink) {
+        const existing = await env.DB.prepare(
+          "SELECT id FROM activation_links WHERE profile_id = ? AND url = ? AND consumed = 0 LIMIT 1"
+        ).bind(profileRow.profile_id, hermesLink).first();
+        if (!existing) {
+        await env.DB.prepare(
+          "INSERT INTO activation_links (id, profile_id, url, created_at, consumed) VALUES (?, ?, ?, ?, 0)"
+        ).bind(generateId(), profileRow.profile_id, hermesLink, now).run();
         }
       }
     }
@@ -1103,5 +1399,7 @@ export default {
     // Clean up unconfirmed addresses older than 48 hours (generated but never received email)
     await env.DB.prepare("DELETE FROM passwords WHERE confirmed = 0 AND created_at < ?")
       .bind(Date.now() - 48 * 3600000).run();
+    // Clean up expired sessions
+    await env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(Date.now()).run();
   },
 };

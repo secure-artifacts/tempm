@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      background: #f5f7ff;
+      color: #1e293b;
+    }
+    .header {
+      background: #4f46e5;
+      color: white;
+      padding: 11px 14px;
+      font-weight: 600;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .header a { color: rgba(255,255,255,0.7); font-size: 11px; text-decoration: none; }
+    .header a:hover { color: white; }
+    .body { padding: 12px; }
+    .btn-generate {
+      width: 100%;
+      padding: 10px;
+      background: #4f46e5;
+      color: white;
+      border: none;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-bottom: 12px;
+    }
+    .btn-generate:hover { background: #4338ca; }
+    .btn-generate:disabled { background: #a5b4fc; cursor: not-allowed; }
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      margin-bottom: 6px;
+    }
+    .empty { color: #94a3b8; font-size: 12px; padding: 8px 0; text-align: center; }
+    .item {
+      background: white;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .item-text {
+      flex: 1;
+      font-family: monospace;
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .btn-copy {
+      flex-shrink: 0;
+      background: #e0e7ff;
+      color: #4f46e5;
+      border: none;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-copy:hover { background: #c7d2fe; }
+    .divider { border: none; border-top: 1px solid #e2e8f0; margin: 10px 0; }
+    .no-profile {
+      padding: 16px;
+      text-align: center;
+      color: #64748b;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+    .no-profile a { color: #4f46e5; }
+    .toast {
+      position: fixed;
+      bottom: 10px; left: 50%;
+      transform: translateX(-50%);
+      background: #1e293b;
+      color: white;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    ✉️ TempMail Activator
+    <a href="options.html" target="_blank">设置</a>
+  </div>
+  <div id="main" class="body"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

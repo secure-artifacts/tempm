@@ -6,10 +6,12 @@ CREATE TABLE IF NOT EXISTS emails (
   subject TEXT DEFAULT '',
   text_body TEXT DEFAULT '',
   html_body TEXT DEFAULT '',
-  timestamp INTEGER NOT NULL
+  timestamp INTEGER NOT NULL,
+  owner_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_emails_to ON emails(mail_to);
+CREATE INDEX IF NOT EXISTS idx_emails_owner_ts ON emails(owner_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_emails_timestamp ON emails(timestamp);
 CREATE INDEX IF NOT EXISTS idx_emails_to_timestamp ON emails(mail_to, timestamp);
 
@@ -34,13 +36,42 @@ CREATE TABLE IF NOT EXISTS passwords (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   last_link_received_at INTEGER,
-  domain TEXT
+  domain TEXT,
+  owner_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_passwords_label_confirmed_created ON passwords(label, confirmed, created_at);
 CREATE INDEX IF NOT EXISTS idx_passwords_confirmed_updated ON passwords(confirmed, updated_at);
 CREATE INDEX IF NOT EXISTS idx_passwords_confirmed_created ON passwords(confirmed, created_at);
 CREATE INDEX IF NOT EXISTS idx_passwords_domain_confirmed_created ON passwords(domain, confirmed, created_at);
+
+-- Multi-user multi-tenant tables (see migrations/2026-05-29_multiuser.sql)
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  daily_limit INTEGER NOT NULL DEFAULT 20,
+  hourly_limit INTEGER NOT NULL DEFAULT 5,
+  lifetime_limit INTEGER NOT NULL DEFAULT 500,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS domain_owner (
+  domain TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  assigned_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_domain_owner_owner ON domain_owner(owner_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
 
 -- Auto cleanup: delete emails older than configured hours
 -- This is done via a cron trigger in the worker

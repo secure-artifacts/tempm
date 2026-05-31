@@ -2,6 +2,10 @@ export interface Env {
   DB: D1Database;
   ALLOWED_ORIGINS: string;
   ADMIN_PASSWORD: string;
+  IMPORT_REQUEST_SECRET?: string;
+  RESEND_API_KEY?: string;
+  IMPORT_NOTIFY_TO?: string;
+  IMPORT_NOTIFY_FROM?: string;
   HERMES_SHARED_SECRET?: string;
   HERMES_USERNAME?: string;
   HERMES_LINK_MATCH?: string;
@@ -23,6 +27,22 @@ interface User {
   created_at: number;
 }
 
+interface ImportRequestRow {
+  id: string;
+  status: string;
+  registrar: string;
+  target_username: string;
+  api_key_tail: string;
+  domain_count: number;
+  domains_text: string;
+  notes: string;
+  requested_by: string;
+  notification_sent: number;
+  notification_error: string;
+  created_at: number;
+  updated_at: number;
+}
+
 // Resolved request actor: admin (ADMIN_PASSWORD bearer) or a logged-in user.
 type Actor = { isAdmin: boolean; user: User | null };
 
@@ -31,6 +51,9 @@ const DEFAULT_DAILY_LIMIT = 20;
 const DEFAULT_HOURLY_LIMIT = 5;
 const DEFAULT_LIFETIME_LIMIT = 500;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const MAX_IMPORT_TEXT_CHARS = 20000;
+const MAX_IMPORT_NOTES_CHARS = 2000;
+const MAX_IMPORT_SECRET_CHARS = 10000;
 // Fallback only — real deployments set HERMES_USERNAME (see wrangler.toml).
 const DEFAULT_HERMES_USERNAME = "hermes";
 const DEFAULT_HERMES_LINK_MATCH = "https://app.heygen.com/magic-web,https://auth.heygen.com/magic-web";
@@ -74,6 +97,90 @@ async function sha256Hex(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
   const buf = await crypto.subtle.digest("SHA-256", data);
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char] || char));
+}
+
+async function importRequestCryptoKey(secret: string): Promise<CryptoKey> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptImportPayload(secret: string, payload: unknown): Promise<string> {
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const key = await importRequestCryptoKey(secret);
+  const plain = new TextEncoder().encode(JSON.stringify(payload));
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
+  return `${bytesToBase64(iv)}.${bytesToBase64(cipher)}`;
+}
+
+async function decryptImportPayload(secret: string, encrypted: string): Promise<Record<string, string>> {
+  const [ivB64, cipherB64] = encrypted.split(".");
+  if (!ivB64 || !cipherB64) throw new Error("invalid encrypted payload");
+  const key = await importRequestCryptoKey(secret);
+  const plain = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64ToBytes(ivB64) },
+    key,
+    base64ToBytes(cipherB64),
+  );
+  return JSON.parse(new TextDecoder().decode(plain)) as Record<string, string>;
+}
+
+async function sendImportRequestNotification(env: Env, request: {
+  id: string; registrar: string; targetUsername: string; requestedBy: string; domainCount: number; notes: string;
+}): Promise<{ sent: boolean; error?: string }> {
+  if (!env.RESEND_API_KEY || !env.IMPORT_NOTIFY_TO || !env.IMPORT_NOTIFY_FROM) {
+    return { sent: false, error: "notification_not_configured" };
+  }
+  const html = `
+    <h2>New domain import request</h2>
+    <p><b>Request ID:</b> ${escapeHtml(request.id)}</p>
+    <p><b>Registrar:</b> ${escapeHtml(request.registrar)}</p>
+    <p><b>Target user:</b> ${escapeHtml(request.targetUsername)}</p>
+    <p><b>Requested by:</b> ${escapeHtml(request.requestedBy || "Not provided")}</p>
+    <p><b>Estimated domains:</b> ${request.domainCount || "Not provided"}</p>
+    <p><b>Notes:</b></p>
+    <pre>${escapeHtml(request.notes || "")}</pre>
+    <p>Open the admin panel to review. This email does not include API keys, secrets, or passwords.</p>
+  `;
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: env.IMPORT_NOTIFY_FROM,
+      to: [env.IMPORT_NOTIFY_TO],
+      subject: `Domain import request pending: ${request.targetUsername}`,
+      html,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { sent: false, error: text.slice(0, 300) || `resend_${res.status}` };
+  }
+  return { sent: true };
 }
 
 function corsHeaders(request: Request, env: Env): Record<string, string> {
@@ -835,6 +942,125 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
       return Response.json({ ok: true }, { headers });
     }
 
+    // GET /api/admin/import-requests — list domain import requests without secrets
+    if (url.pathname === "/api/admin/import-requests" && request.method === "GET") {
+      const rows = await env.DB.prepare(
+        "SELECT id, status, registrar, target_username, api_key_tail, domain_count, domains_text, notes, requested_by, notification_sent, notification_error, created_at, updated_at FROM domain_import_requests ORDER BY created_at DESC LIMIT 100"
+      ).all();
+      const requests = ((rows.results || []) as unknown as ImportRequestRow[]).map((r) => ({
+        id: r.id,
+        status: r.status,
+        registrar: r.registrar,
+        targetUsername: r.target_username,
+        apiKeyTail: r.api_key_tail,
+        domainCount: r.domain_count,
+        domainsText: r.domains_text,
+        notes: r.notes,
+        requestedBy: r.requested_by,
+        notificationSent: !!r.notification_sent,
+        notificationError: r.notification_error || "",
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      }));
+      return Response.json({ requests }, { headers });
+    }
+
+    // POST /api/admin/import-requests — create a standardized registrar import request
+    if (url.pathname === "/api/admin/import-requests" && request.method === "POST") {
+      if (!env.IMPORT_REQUEST_SECRET) {
+        return Response.json({ error: "IMPORT_REQUEST_SECRET is required to store request credentials" }, { status: 500, headers });
+      }
+      const body = JSON.parse(await request.text()) as {
+        registrar?: string; apiKey?: string; apiSecret?: string; targetUsername?: string; targetPassword?: string;
+        domainsText?: string; notes?: string; requestedBy?: string;
+      };
+      const registrar = (body.registrar || "spaceship").trim().toLowerCase();
+      const apiKey = (body.apiKey || "").trim();
+      const apiSecret = (body.apiSecret || "").trim();
+      const targetUsername = (body.targetUsername || "").trim();
+      const targetPassword = body.targetPassword || "";
+      const domainsText = (body.domainsText || "").trim();
+      const notes = (body.notes || "").trim();
+      const requestedBy = (body.requestedBy || "").trim();
+      if (!registrar || !apiKey || !apiSecret || !targetUsername || !targetPassword) {
+        return Response.json({ error: "registrar, apiKey, apiSecret, targetUsername, and targetPassword are required" }, { status: 400, headers });
+      }
+      if (!/^[a-z0-9_-]{2,40}$/.test(registrar) || !/^[a-zA-Z0-9_.@-]{2,80}$/.test(targetUsername)) {
+        return Response.json({ error: "invalid registrar or targetUsername" }, { status: 400, headers });
+      }
+      if (
+        apiKey.length > MAX_IMPORT_SECRET_CHARS ||
+        apiSecret.length > MAX_IMPORT_SECRET_CHARS ||
+        targetPassword.length > MAX_IMPORT_SECRET_CHARS ||
+        domainsText.length > MAX_IMPORT_TEXT_CHARS ||
+        notes.length > MAX_IMPORT_NOTES_CHARS ||
+        requestedBy.length > 200
+      ) {
+        return Response.json({ error: "request payload is too large" }, { status: 413, headers });
+      }
+      const domainCount = domainsText ? domainsText.split(/[\s,]+/).filter(Boolean).length : 0;
+      const id = generateId();
+      const now = Date.now();
+      const encrypted_payload = await encryptImportPayload(env.IMPORT_REQUEST_SECRET, {
+        apiKey, apiSecret, targetPassword,
+      });
+      const notify = await sendImportRequestNotification(env, {
+        id, registrar, targetUsername, requestedBy, domainCount, notes,
+      });
+      await env.DB.prepare(
+        `INSERT INTO domain_import_requests (
+          id, status, registrar, target_username, api_key_tail, encrypted_payload,
+          domain_count, domains_text, notes, requested_by, notification_sent,
+          notification_error, created_at, updated_at
+        ) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        id, registrar, targetUsername, apiKey.slice(-6), encrypted_payload,
+        domainCount, domainsText, notes, requestedBy, notify.sent ? 1 : 0,
+        notify.error || "", now, now,
+      ).run();
+      return Response.json({ ok: true, id, notificationSent: notify.sent, notificationError: notify.error || "" }, { headers });
+    }
+
+    // POST /api/admin/import-requests/status — admin approval workflow
+    if (url.pathname === "/api/admin/import-requests/status" && request.method === "POST") {
+      const body = JSON.parse(await request.text()) as { id?: string; status?: string };
+      const id = (body.id || "").trim();
+      const status = (body.status || "").trim().toLowerCase();
+      if (!id || !["pending", "approved", "rejected", "processing", "done"].includes(status)) {
+        return Response.json({ error: "invalid id or status" }, { status: 400, headers });
+      }
+      const result = await env.DB.prepare(
+        "UPDATE domain_import_requests SET status = ?, updated_at = ? WHERE id = ?"
+      ).bind(status, Date.now(), id).run();
+      if (!result.meta?.changes) {
+        return Response.json({ error: "request not found" }, { status: 404, headers });
+      }
+      return Response.json({ ok: true }, { headers });
+    }
+
+    // POST /api/admin/import-requests/reveal — reveal encrypted credentials after approval
+    if (url.pathname === "/api/admin/import-requests/reveal" && request.method === "POST") {
+      if (!env.IMPORT_REQUEST_SECRET) {
+        return Response.json({ error: "IMPORT_REQUEST_SECRET is not configured" }, { status: 500, headers });
+      }
+      const body = JSON.parse(await request.text()) as { id?: string };
+      const id = (body.id || "").trim();
+      if (!id) return Response.json({ error: "id required" }, { status: 400, headers });
+      const row = await env.DB.prepare(
+        "SELECT id, status, encrypted_payload FROM domain_import_requests WHERE id = ?"
+      ).bind(id).first() as { id: string; status: string; encrypted_payload: string } | null;
+      if (!row) return Response.json({ error: "request not found" }, { status: 404, headers });
+      if (!["approved", "processing"].includes(row.status)) {
+        return Response.json({ error: "credentials can only be revealed after approval" }, { status: 409, headers });
+      }
+      const payload = await decryptImportPayload(env.IMPORT_REQUEST_SECRET, row.encrypted_payload);
+      return Response.json({
+        apiKey: payload.apiKey || "",
+        apiSecret: payload.apiSecret || "",
+        targetPassword: payload.targetPassword || "",
+      }, { headers });
+    }
+
     // DELETE /api/admin/users — delete a user, release domains, orphan their data
     if (url.pathname === "/api/admin/users" && request.method === "DELETE") {
       const body = JSON.parse(await request.text()) as { username?: string };
@@ -945,7 +1171,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const username = (url.searchParams.get("username") || "").trim().toLowerCase();
     if (username) {
       const u = await getUserByUsername(env.DB, username);
-      return { ownerId: u ? u.id : " __none__", all: false };
+      return { ownerId: u ? u.id : "\0__none__", all: false };
     }
     return { ownerId: null, all: true };
   }

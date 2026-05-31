@@ -18,6 +18,21 @@ interface AdminUser {
   dailyLimit: number; hourlyLimit: number; lifetimeLimit: number;
   domains: { domain: string; enabled: number }[];
 }
+interface ImportRequest {
+  id: string;
+  status: string;
+  registrar: string;
+  targetUsername: string;
+  apiKeyTail: string;
+  domainCount: number;
+  domainsText: string;
+  notes: string;
+  requestedBy: string;
+  notificationSent: boolean;
+  notificationError: string;
+  createdAt: number;
+  updatedAt: number;
+}
 
 export default function AdminPage() {
   const [token, setToken] = useState<string | null>(null);
@@ -29,6 +44,7 @@ export default function AdminPage() {
   });
   const [stats, setStats] = useState<Stats>({ totalEmails: 0, todayEmails: 0 });
   const [users, setUsers] = useState<AdminUser[]>([]);
+  const [importRequests, setImportRequests] = useState<ImportRequest[]>([]);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -36,6 +52,14 @@ export default function AdminPage() {
   const [newPool2, setNewPool2] = useState("");
   const [newFwdSubdomain, setNewFwdSubdomain] = useState("");
   const [newFwdTarget, setNewFwdTarget] = useState("");
+  const [irRegistrar, setIrRegistrar] = useState("spaceship");
+  const [irApiKey, setIrApiKey] = useState("");
+  const [irApiSecret, setIrApiSecret] = useState("");
+  const [irTargetUsername, setIrTargetUsername] = useState("");
+  const [irTargetPassword, setIrTargetPassword] = useState("");
+  const [irDomainsText, setIrDomainsText] = useState("");
+  const [irNotes, setIrNotes] = useState("");
+  const [irRequestedBy, setIrRequestedBy] = useState("");
 
   // New user inputs
   const [nuName, setNuName] = useState("");
@@ -84,8 +108,16 @@ export default function AdminPage() {
     catch { /* ignore */ }
   }, [token]);
 
+  const loadImportRequests = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(`${WORKER_URL}/api/admin/import-requests`, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) setImportRequests((await res.json()).requests || []);
+    } catch { /* ignore */ }
+  }, [token]);
+
   useEffect(() => { const saved = localStorage.getItem("admin_token"); if (saved) setToken(saved); }, []);
-  useEffect(() => { if (token) { loadConfig(); loadStats(); loadUsers(); } }, [token, loadConfig, loadStats, loadUsers]);
+  useEffect(() => { if (token) { loadConfig(); loadStats(); loadUsers(); loadImportRequests(); } }, [token, loadConfig, loadStats, loadUsers, loadImportRequests]);
 
   const saveConfig = async () => {
     if (!token) return;
@@ -106,6 +138,51 @@ export default function AdminPage() {
     if (!confirm("确定清空所有邮件？此操作不可恢复。")) return;
     try { await fetch(`${WORKER_URL}/api/admin/emails`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); showToast("✅ 已清空所有邮件"); loadStats(); }
     catch { showToast("❌ 操作失败"); }
+  };
+
+  const submitImportRequest = async () => {
+    if (!irApiKey || !irApiSecret || !irTargetUsername || !irTargetPassword) {
+      showToast("⚠️ API 和目标账号信息必填"); return;
+    }
+    const res = await fetch(`${WORKER_URL}/api/admin/import-requests`, {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        registrar: irRegistrar, apiKey: irApiKey, apiSecret: irApiSecret,
+        targetUsername: irTargetUsername, targetPassword: irTargetPassword,
+        domainsText: irDomainsText, notes: irNotes, requestedBy: irRequestedBy,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      setIrApiKey(""); setIrApiSecret(""); setIrTargetPassword(""); setIrDomainsText(""); setIrNotes("");
+      showToast(data.notificationSent ? "✅ 申请已提交并已发送邮件" : "✅ 申请已提交；邮件通知未配置");
+      loadImportRequests();
+    } else {
+      showToast("❌ " + (data.error || "提交失败"));
+    }
+  };
+
+  const setImportRequestStatus = async (id: string, status: string) => {
+    const res = await fetch(`${WORKER_URL}/api/admin/import-requests/status`, {
+      method: "POST", headers: authHeaders(), body: JSON.stringify({ id, status }),
+    });
+    if (res.ok) { showToast("✅ 状态已更新"); loadImportRequests(); }
+    else showToast("❌ 状态更新失败");
+  };
+
+  const copyImportRequestCredentials = async (requestId: string) => {
+    if (!confirm("确认复制该申请的 API Key、Secret 和目标账号密码？")) return;
+    const res = await fetch(`${WORKER_URL}/api/admin/import-requests/reveal`, {
+      method: "POST", headers: authHeaders(), body: JSON.stringify({ id: requestId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast("❌ " + (data.error || "无法读取凭据")); return; }
+    try {
+      await navigator.clipboard.writeText(`API Key: ${data.apiKey}\nAPI Secret: ${data.apiSecret}\nTarget password: ${data.targetPassword}`);
+      showToast("✅ 凭据已复制");
+    } catch {
+      showToast("❌ 浏览器不允许复制，请使用 API 读取凭据");
+    }
   };
 
   // ── Domain pools / forward rules (saved via saveConfig) ──
@@ -204,6 +281,53 @@ export default function AdminPage() {
         <div className="grid grid-cols-2 gap-4 mb-8">
           <div className="card text-center"><div className="text-3xl font-bold" style={{ color: "var(--primary)" }}>{stats.totalEmails}</div><div className="text-sm text-gray-500 mt-1">总邮件数</div></div>
           <div className="card text-center"><div className="text-3xl font-bold" style={{ color: "var(--primary)" }}>{stats.todayEmails}</div><div className="text-sm text-gray-500 mt-1">今日邮件</div></div>
+        </div>
+
+        {/* Domain import requests */}
+        <div className="card mb-6">
+          <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--primary)" }}>📥 域名接入申请</h2>
+          <p className="text-sm text-gray-500 mb-4">提交注册商 API 信息和目标账号后，凭据会加密保存。邮件通知只发送摘要，不包含 API Key、Secret 或密码。</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            <input type="text" placeholder="注册商，如 spaceship" value={irRegistrar} onChange={e => setIrRegistrar(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="text" placeholder="提交人/备注名" value={irRequestedBy} onChange={e => setIrRequestedBy(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="password" placeholder="API Key" value={irApiKey} onChange={e => setIrApiKey(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="password" placeholder="API Secret" value={irApiSecret} onChange={e => setIrApiSecret(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="text" placeholder="目标用户名" value={irTargetUsername} onChange={e => setIrTargetUsername(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="password" placeholder="目标账号密码" value={irTargetPassword} onChange={e => setIrTargetPassword(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+          </div>
+          <textarea placeholder="域名清单，可留空；支持换行、空格或逗号分隔" value={irDomainsText} onChange={e => setIrDomainsText(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 90 }} />
+          <textarea placeholder="处理要求/备注" value={irNotes} onChange={e => setIrNotes(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 70 }} />
+          <button onClick={submitImportRequest} className="px-6 py-2 rounded-lg font-medium text-white text-sm" style={{ background: "var(--primary)" }}>提交接入申请</button>
+
+          <div className="space-y-2 mt-4">
+            {importRequests.length === 0 && <p className="text-gray-400 text-sm py-2">暂无申请</p>}
+            {importRequests.map(r => (
+              <div key={r.id} className="bg-gray-50 rounded-lg px-4 py-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div>
+                    <span className="font-mono text-sm font-semibold">{r.targetUsername}</span>
+                    <span className="text-xs text-gray-400 ml-2">{r.registrar} · {r.domainCount || "未知"} 个域名 · key尾号 {r.apiKeyTail || "n/a"}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <select value={r.status} onChange={e => setImportRequestStatus(r.id, e.target.value)} className="text-xs border rounded px-2 py-1" style={{ borderColor: "#e0e0e0" }}>
+                      <option value="pending">pending</option>
+                      <option value="approved">approved</option>
+                      <option value="rejected">rejected</option>
+                      <option value="processing">processing</option>
+                      <option value="done">done</option>
+                    </select>
+                    {["approved", "processing"].includes(r.status) && (
+                      <button onClick={() => copyImportRequestCredentials(r.id)} className="text-xs text-blue-500 hover:text-blue-700">复制凭据</button>
+                    )}
+                  </div>
+                </div>
+                <div className="text-xs text-gray-500 mt-2">
+                  通知：{r.notificationSent ? "已发送" : (r.notificationError || "未配置")} · 提交人：{r.requestedBy || "未填写"}
+                </div>
+                {r.notes && <div className="text-xs text-gray-500 mt-1 whitespace-pre-wrap">{r.notes}</div>}
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* Users */}

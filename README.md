@@ -39,6 +39,7 @@
 - **标签分组（Tag）** — 给邮箱打标签，批量管理同类账号
 - **转发规则** — 指定子域名的来信自动转发到你的真实邮箱
 - **管理员面板** — 在线管理用户、域名分配、全局域名列表、转发规则、自动清理周期、站点密码等
+- **域名接入申请（可选）** — 在管理员面板标准化提交注册商 API 接入请求，敏感凭据加密保存，并可发送不含密钥的邮件通知
 - **访问密码** — 可为网站设置访问密码，防止陌生人使用
 - **自动清理** — 定时删除过期邮件，避免数据库膨胀
 - **Hermes 机器对机器集成（可选）** — 通过共享密钥的专用接口，供自动化程序按用户领取地址、拉取激活链接
@@ -62,7 +63,8 @@ Cloudflare Worker（后端 API）
     │     ├── config 表（站点配置）
     │     ├── users 表（登录用户 + 每域名配额）
     │     ├── domain_owner 表（域名独占归属）
-    │     └── sessions 表（用户登录会话）
+    │     ├── sessions 表（用户登录会话）
+    │     └── domain_import_requests 表（可选：域名接入申请，凭据加密保存）
     │
     └── Cloudflare Email Routing
           └── 收到发往你域名的邮件 → 触发 Worker → 写入 D1
@@ -163,13 +165,19 @@ ALLOWED_ORIGINS = "http://localhost:3000"
 # 管理员密码（自己设一个强密码）。管理员凭此密码登录 /admin 管理用户和域名分配
 ADMIN_PASSWORD = "你的管理员密码"
 
+# ── 以下为域名接入申请的可选项 ──
+# IMPORT_REQUEST_SECRET = "用于加密注册商 API 凭据的高强度随机密钥，建议用 wrangler secret 注入"
+# RESEND_API_KEY        = "Resend 邮件 API Key，用于申请通知；不配置则只保存申请"
+# IMPORT_NOTIFY_TO      = "接收通知的邮箱"
+# IMPORT_NOTIFY_FROM    = "Resend 已验证的发件地址"
+
 # ── 以下为 Hermes 机器对机器集成的可选项，不用自动化对接可全部省略 ──
 # HERMES_SHARED_SECRET = "调用方与 Worker 之间的共享密钥"
 # HERMES_USERNAME      = "自动化流程归属的用户名（默认 hermes）"
 # HERMES_LINK_MATCH    = "激活链接前缀白名单，逗号分隔，按前缀匹配"
 ```
 
-> **安全建议**：`ADMIN_PASSWORD`、`HERMES_SHARED_SECRET` 等敏感值更推荐用 `npx wrangler secret put <NAME>` 存为 Secret，而不是明文写进 `wrangler.toml` 提交到仓库。
+> **安全建议**：`ADMIN_PASSWORD`、`IMPORT_REQUEST_SECRET`、`RESEND_API_KEY`、`HERMES_SHARED_SECRET` 等敏感值更推荐用 `npx wrangler secret put <NAME>` 存为 Secret，而不是明文写进 `wrangler.toml` 提交到仓库。启用域名接入申请时，`IMPORT_REQUEST_SECRET` 是必需项；邮件通知相关变量是可选项。
 
 > **如何找到 Cloudflare 账号 ID**：登录 [Cloudflare Dashboard](https://dash.cloudflare.com)，点击右上角头像 → "My Profile"，或在任意域名页面右侧栏找到 "Account ID"。
 
@@ -188,6 +196,8 @@ npm run db:init
 > ```
 >
 > 多用户相关的 `users` / `domain_owner` / `sessions` 表及 `owner_id` 列即来自该迁移。
+
+> 域名接入申请功能需要执行 `worker/migrations/2026-05-31_import_requests.sql`，并设置 `IMPORT_REQUEST_SECRET`。如需邮件提醒，再配置 `RESEND_API_KEY`、`IMPORT_NOTIFY_TO`、`IMPORT_NOTIFY_FROM`。
 
 #### 2.5 部署 Worker
 

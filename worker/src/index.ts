@@ -31,7 +31,8 @@ const DEFAULT_DAILY_LIMIT = 20;
 const DEFAULT_HOURLY_LIMIT = 5;
 const DEFAULT_LIFETIME_LIMIT = 500;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const DEFAULT_HERMES_USERNAME = "steven";
+// Fallback only — real deployments set HERMES_USERNAME (see wrangler.toml).
+const DEFAULT_HERMES_USERNAME = "hermes";
 const DEFAULT_HERMES_LINK_MATCH = "https://app.heygen.com/magic-web,https://auth.heygen.com/magic-web";
 
 // ========== Helpers ==========

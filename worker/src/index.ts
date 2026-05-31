@@ -147,7 +147,7 @@ async function decryptImportPayload(secret: string, encrypted: string): Promise<
 }
 
 async function sendImportRequestNotification(env: Env, request: {
-  id: string; registrar: string; targetUsername: string; requestedBy: string; domainCount: number; notes: string;
+  id: string; registrar: string; targetUsername: string; requestedBy: string; domainCount: number; notes: string; hasAccountDetails: boolean;
 }): Promise<{ sent: boolean; error?: string }> {
   if (!env.RESEND_API_KEY || !env.IMPORT_NOTIFY_TO || !env.IMPORT_NOTIFY_FROM) {
     return { sent: false, error: "notification_not_configured" };
@@ -159,6 +159,7 @@ async function sendImportRequestNotification(env: Env, request: {
     <p><b>Target user:</b> ${escapeHtml(request.targetUsername)}</p>
     <p><b>Requested by:</b> ${escapeHtml(request.requestedBy || "Not provided")}</p>
     <p><b>Estimated domains:</b> ${request.domainCount || "Not provided"}</p>
+    <p><b>Account details:</b> ${request.hasAccountDetails ? "Provided in encrypted storage" : "Single account fields only"}</p>
     <p><b>Notes:</b></p>
     <pre>${escapeHtml(request.notes || "")}</pre>
     <p>Open the admin panel to review. This email does not include API keys, secrets, or passwords.</p>
@@ -972,26 +973,29 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
       }
       const body = JSON.parse(await request.text()) as {
         registrar?: string; apiKey?: string; apiSecret?: string; targetUsername?: string; targetPassword?: string;
-        domainsText?: string; notes?: string; requestedBy?: string;
+        targetAccountsText?: string; domainsText?: string; notes?: string; requestedBy?: string;
       };
       const registrar = (body.registrar || "spaceship").trim().toLowerCase();
       const apiKey = (body.apiKey || "").trim();
       const apiSecret = (body.apiSecret || "").trim();
       const targetUsername = (body.targetUsername || "").trim();
       const targetPassword = body.targetPassword || "";
+      const targetAccountsText = (body.targetAccountsText || "").trim();
       const domainsText = (body.domainsText || "").trim();
       const notes = (body.notes || "").trim();
       const requestedBy = (body.requestedBy || "").trim();
-      if (!registrar || !apiKey || !apiSecret || !targetUsername || !targetPassword) {
-        return Response.json({ error: "registrar, apiKey, apiSecret, targetUsername, and targetPassword are required" }, { status: 400, headers });
+      if (!registrar || !apiKey || !apiSecret || (!targetAccountsText && (!targetUsername || !targetPassword))) {
+        return Response.json({ error: "registrar, apiKey, apiSecret, and either a single target account or account details are required" }, { status: 400, headers });
       }
-      if (!/^[a-z0-9_-]{2,40}$/.test(registrar) || !/^[a-zA-Z0-9_.@-]{2,80}$/.test(targetUsername)) {
+      const targetSummary = targetUsername || "multiple-accounts";
+      if (!/^[a-z0-9_-]{2,40}$/.test(registrar) || !/^[a-zA-Z0-9_.@-]{2,80}$/.test(targetSummary)) {
         return Response.json({ error: "invalid registrar or targetUsername" }, { status: 400, headers });
       }
       if (
         apiKey.length > MAX_IMPORT_SECRET_CHARS ||
         apiSecret.length > MAX_IMPORT_SECRET_CHARS ||
         targetPassword.length > MAX_IMPORT_SECRET_CHARS ||
+        targetAccountsText.length > MAX_IMPORT_TEXT_CHARS ||
         domainsText.length > MAX_IMPORT_TEXT_CHARS ||
         notes.length > MAX_IMPORT_NOTES_CHARS ||
         requestedBy.length > 200
@@ -1002,10 +1006,10 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
       const id = generateId();
       const now = Date.now();
       const encrypted_payload = await encryptImportPayload(env.IMPORT_REQUEST_SECRET, {
-        apiKey, apiSecret, targetPassword,
+        apiKey, apiSecret, targetPassword, targetAccountsText,
       });
       const notify = await sendImportRequestNotification(env, {
-        id, registrar, targetUsername, requestedBy, domainCount, notes,
+        id, registrar, targetUsername: targetSummary, requestedBy, domainCount, notes, hasAccountDetails: !!targetAccountsText,
       });
       await env.DB.prepare(
         `INSERT INTO domain_import_requests (
@@ -1014,7 +1018,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
           notification_error, created_at, updated_at
         ) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
-        id, registrar, targetUsername, apiKey.slice(-6), encrypted_payload,
+        id, registrar, targetSummary, apiKey.slice(-6), encrypted_payload,
         domainCount, domainsText, notes, requestedBy, notify.sent ? 1 : 0,
         notify.error || "", now, now,
       ).run();
@@ -1058,6 +1062,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
         apiKey: payload.apiKey || "",
         apiSecret: payload.apiSecret || "",
         targetPassword: payload.targetPassword || "",
+        targetAccountsText: payload.targetAccountsText || "",
       }, { headers });
     }
 

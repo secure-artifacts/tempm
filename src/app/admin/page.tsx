@@ -57,6 +57,7 @@ export default function AdminPage() {
   const [irApiSecret, setIrApiSecret] = useState("");
   const [irTargetUsername, setIrTargetUsername] = useState("");
   const [irTargetPassword, setIrTargetPassword] = useState("");
+  const [irTargetAccountsText, setIrTargetAccountsText] = useState("");
   const [irDomainsText, setIrDomainsText] = useState("");
   const [irNotes, setIrNotes] = useState("");
   const [irRequestedBy, setIrRequestedBy] = useState("");
@@ -141,20 +142,20 @@ export default function AdminPage() {
   };
 
   const submitImportRequest = async () => {
-    if (!irApiKey || !irApiSecret || !irTargetUsername || !irTargetPassword) {
-      showToast("⚠️ API 和目标账号信息必填"); return;
+    if (!irApiKey || !irApiSecret || (!irTargetAccountsText && (!irTargetUsername || !irTargetPassword))) {
+      showToast("⚠️ API 信息必填；目标账号请填写单账号或多账号明细"); return;
     }
     const res = await fetch(`${WORKER_URL}/api/admin/import-requests`, {
       method: "POST", headers: authHeaders(),
       body: JSON.stringify({
         registrar: irRegistrar, apiKey: irApiKey, apiSecret: irApiSecret,
         targetUsername: irTargetUsername, targetPassword: irTargetPassword,
-        domainsText: irDomainsText, notes: irNotes, requestedBy: irRequestedBy,
+        targetAccountsText: irTargetAccountsText, domainsText: irDomainsText, notes: irNotes, requestedBy: irRequestedBy,
       }),
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
-      setIrApiKey(""); setIrApiSecret(""); setIrTargetPassword(""); setIrDomainsText(""); setIrNotes("");
+      setIrApiKey(""); setIrApiSecret(""); setIrTargetPassword(""); setIrTargetAccountsText(""); setIrDomainsText(""); setIrNotes("");
       showToast(data.notificationSent ? "✅ 申请已提交并已发送邮件" : "✅ 申请已提交；邮件通知未配置");
       loadImportRequests();
     } else {
@@ -177,8 +178,9 @@ export default function AdminPage() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) { showToast("❌ " + (data.error || "无法读取凭据")); return; }
+    const accountDetails = data.targetAccountsText ? `\n\nAccount details:\n${data.targetAccountsText}` : "";
     try {
-      await navigator.clipboard.writeText(`API Key: ${data.apiKey}\nAPI Secret: ${data.apiSecret}\nTarget password: ${data.targetPassword}`);
+      await navigator.clipboard.writeText(`API Key: ${data.apiKey}\nAPI Secret: ${data.apiSecret}\nTarget password: ${data.targetPassword}${accountDetails}`);
       showToast("✅ 凭据已复制");
     } catch {
       showToast("❌ 浏览器不允许复制，请使用 API 读取凭据");
@@ -286,17 +288,19 @@ export default function AdminPage() {
         {/* Domain import requests */}
         <div className="card mb-6">
           <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--primary)" }}>📥 域名接入申请</h2>
-          <p className="text-sm text-gray-500 mb-4">提交注册商 API 信息和目标账号后，凭据会加密保存。邮件通知只发送摘要，不包含 API Key、Secret 或密码。</p>
+          <p className="text-sm text-gray-500 mb-2">提交注册商 API 信息和目标账号后，凭据会加密保存。邮件通知只发送摘要，不包含 API Key、Secret 或密码。</p>
+          <p className="text-sm text-gray-500 mb-4">Spaceship API Key 和 Secret 可在 <a href="https://www.spaceship.com/zh/application/api-manager/" target="_blank" rel="noreferrer" className="text-blue-500 hover:text-blue-700 underline">API Manager</a> 创建或查看。</p>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
             <input type="text" placeholder="注册商，如 spaceship" value={irRegistrar} onChange={e => setIrRegistrar(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
             <input type="text" placeholder="提交人/备注名" value={irRequestedBy} onChange={e => setIrRequestedBy(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
             <input type="password" placeholder="API Key" value={irApiKey} onChange={e => setIrApiKey(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
             <input type="password" placeholder="API Secret" value={irApiSecret} onChange={e => setIrApiSecret(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
-            <input type="text" placeholder="目标用户名" value={irTargetUsername} onChange={e => setIrTargetUsername(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
-            <input type="password" placeholder="目标账号密码" value={irTargetPassword} onChange={e => setIrTargetPassword(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="text" placeholder="单账号用户名（简单场景）" value={irTargetUsername} onChange={e => setIrTargetUsername(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="password" placeholder="单账号密码（简单场景）" value={irTargetPassword} onChange={e => setIrTargetPassword(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
           </div>
+          <textarea placeholder={"多账号接入明细，可填写多个用户名/密码/域名分配要求；会加密保存，不会出现在通知邮件里。示例：\nuser_a / password / 10 domains\nuser_b / password / example.com, example.net"} value={irTargetAccountsText} onChange={e => setIrTargetAccountsText(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 110 }} />
           <textarea placeholder="域名清单，可留空；支持换行、空格或逗号分隔" value={irDomainsText} onChange={e => setIrDomainsText(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 90 }} />
-          <textarea placeholder="处理要求/备注" value={irNotes} onChange={e => setIrNotes(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 70 }} />
+          <textarea placeholder="处理要求/备注（不要在这里写密码；密码请放在上方多账号明细）" value={irNotes} onChange={e => setIrNotes(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 70 }} />
           <button onClick={submitImportRequest} className="px-6 py-2 rounded-lg font-medium text-white text-sm" style={{ background: "var(--primary)" }}>提交接入申请</button>
 
           <div className="space-y-2 mt-4">

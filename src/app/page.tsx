@@ -6,8 +6,15 @@ import { WORKER_URL } from "@/lib/config";
 
 function generatePassword(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%^&*";
-  return Array.from(crypto.getRandomValues(new Uint8Array(12)))
-    .map(b => chars[b % chars.length]).join("");
+  // Rejection sampling: plain `byte % chars.length` biases toward the first
+  // (256 % chars.length) characters. Discard bytes in the non-uniform tail.
+  const limit = 256 - (256 % chars.length);
+  const out: string[] = [];
+  while (out.length < 12) {
+    const [b] = crypto.getRandomValues(new Uint8Array(1));
+    if (b < limit) out.push(chars[b % chars.length]);
+  }
+  return out.join("");
 }
 
 interface PwEntry {

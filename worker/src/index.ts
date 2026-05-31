@@ -518,7 +518,10 @@ function extractActivationLink(htmlBody: string, textBody: string, linkFilter: s
   const re = /https?:\/\/[^\s"'<>)]+/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(content)) !== null) {
-    if (m[0].includes(linkFilter)) return m[0].replace(/[.,;!?]+$/, "");
+    // startsWith (not includes): the activation link must BEGIN with the trusted
+    // prefix. includes() would match attacker-controlled mail like
+    // https://evil.com/?next=https://auth.heygen.com/... and return the evil URL.
+    if (m[0].startsWith(linkFilter)) return m[0].replace(/[.,;!?]+$/, "");
   }
   return null;
 }

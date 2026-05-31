@@ -11,7 +11,7 @@
 -- NOTE: lower()/trim() here are SQLite builtins — ASCII-only lowercasing and
 -- space-only trimming. That matches the realistic drift (mixed case / leading
 -- or trailing spaces). If a deployment has two rows that collapse to the same
--- normalized username (e.g. 'Steven' and 'steven'), this UPDATE will abort on
+-- normalized username (e.g. 'Alice' and 'alice'), this UPDATE will abort on
 -- the UNIQUE(username) constraint; resolve the duplicate manually first.
 
 UPDATE users

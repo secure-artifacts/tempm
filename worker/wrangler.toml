@@ -19,3 +19,9 @@ ALLOWED_ORIGINS = "https://your-app.vercel.app,http://localhost:3000"
 # Prefer setting the admin password as a secret instead of committing it:
 #   npx wrangler secret put ADMIN_PASSWORD
 ADMIN_PASSWORD = "change-me"
+
+# Optional domain import request workflow:
+#   npx wrangler secret put IMPORT_REQUEST_SECRET
+#   npx wrangler secret put RESEND_API_KEY
+# IMPORT_NOTIFY_TO = "owner@example.com"
+# IMPORT_NOTIFY_FROM = "Temp Mail <notifications@example.com>"

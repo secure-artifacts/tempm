@@ -18,6 +18,21 @@ interface AdminUser {
   dailyLimit: number; hourlyLimit: number; lifetimeLimit: number;
   domains: { domain: string; enabled: number }[];
 }
+interface ImportRequest {
+  id: string;
+  status: string;
+  registrar: string;
+  targetUsername: string;
+  apiKeyTail: string;
+  domainCount: number;
+  domainsText: string;
+  notes: string;
+  requestedBy: string;
+  notificationSent: boolean;
+  notificationError: string;
+  createdAt: number;
+  updatedAt: number;
+}
 
 export default function AdminPage() {
   const [token, setToken] = useState<string | null>(null);
@@ -29,6 +44,7 @@ export default function AdminPage() {
   });
   const [stats, setStats] = useState<Stats>({ totalEmails: 0, todayEmails: 0 });
   const [users, setUsers] = useState<AdminUser[]>([]);
+  const [importRequests, setImportRequests] = useState<ImportRequest[]>([]);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -36,6 +52,15 @@ export default function AdminPage() {
   const [newPool2, setNewPool2] = useState("");
   const [newFwdSubdomain, setNewFwdSubdomain] = useState("");
   const [newFwdTarget, setNewFwdTarget] = useState("");
+  const [irRegistrar, setIrRegistrar] = useState("spaceship");
+  const [irApiKey, setIrApiKey] = useState("");
+  const [irApiSecret, setIrApiSecret] = useState("");
+  const [irTargetUsername, setIrTargetUsername] = useState("");
+  const [irTargetPassword, setIrTargetPassword] = useState("");
+  const [irTargetAccountsText, setIrTargetAccountsText] = useState("");
+  const [irDomainsText, setIrDomainsText] = useState("");
+  const [irNotes, setIrNotes] = useState("");
+  const [irRequestedBy, setIrRequestedBy] = useState("");
 
   // New user inputs
   const [nuName, setNuName] = useState("");
@@ -84,8 +109,16 @@ export default function AdminPage() {
     catch { /* ignore */ }
   }, [token]);
 
+  const loadImportRequests = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(`${WORKER_URL}/api/admin/import-requests`, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) setImportRequests((await res.json()).requests || []);
+    } catch { /* ignore */ }
+  }, [token]);
+
   useEffect(() => { const saved = localStorage.getItem("admin_token"); if (saved) setToken(saved); }, []);
-  useEffect(() => { if (token) { loadConfig(); loadStats(); loadUsers(); } }, [token, loadConfig, loadStats, loadUsers]);
+  useEffect(() => { if (token) { loadConfig(); loadStats(); loadUsers(); loadImportRequests(); } }, [token, loadConfig, loadStats, loadUsers, loadImportRequests]);
 
   const saveConfig = async () => {
     if (!token) return;
@@ -106,6 +139,52 @@ export default function AdminPage() {
     if (!confirm("确定清空所有邮件？此操作不可恢复。")) return;
     try { await fetch(`${WORKER_URL}/api/admin/emails`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); showToast("✅ 已清空所有邮件"); loadStats(); }
     catch { showToast("❌ 操作失败"); }
+  };
+
+  const submitImportRequest = async () => {
+    if (!irApiKey || !irApiSecret || (!irTargetAccountsText && (!irTargetUsername || !irTargetPassword))) {
+      showToast("⚠️ API 信息必填；目标账号请填写单账号或多账号明细"); return;
+    }
+    const res = await fetch(`${WORKER_URL}/api/admin/import-requests`, {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        registrar: irRegistrar, apiKey: irApiKey, apiSecret: irApiSecret,
+        targetUsername: irTargetUsername, targetPassword: irTargetPassword,
+        targetAccountsText: irTargetAccountsText, domainsText: irDomainsText, notes: irNotes, requestedBy: irRequestedBy,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      setIrApiKey(""); setIrApiSecret(""); setIrTargetPassword(""); setIrTargetAccountsText(""); setIrDomainsText(""); setIrNotes("");
+      showToast(data.notificationSent ? "✅ 申请已提交并已发送邮件" : "✅ 申请已提交；邮件通知未配置");
+      loadImportRequests();
+    } else {
+      showToast("❌ " + (data.error || "提交失败"));
+    }
+  };
+
+  const setImportRequestStatus = async (id: string, status: string) => {
+    const res = await fetch(`${WORKER_URL}/api/admin/import-requests/status`, {
+      method: "POST", headers: authHeaders(), body: JSON.stringify({ id, status }),
+    });
+    if (res.ok) { showToast("✅ 状态已更新"); loadImportRequests(); }
+    else showToast("❌ 状态更新失败");
+  };
+
+  const copyImportRequestCredentials = async (requestId: string) => {
+    if (!confirm("确认复制该申请的 API Key、Secret 和目标账号密码？")) return;
+    const res = await fetch(`${WORKER_URL}/api/admin/import-requests/reveal`, {
+      method: "POST", headers: authHeaders(), body: JSON.stringify({ id: requestId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast("❌ " + (data.error || "无法读取凭据")); return; }
+    const accountDetails = data.targetAccountsText ? `\n\nAccount details:\n${data.targetAccountsText}` : "";
+    try {
+      await navigator.clipboard.writeText(`API Key: ${data.apiKey}\nAPI Secret: ${data.apiSecret}\nTarget password: ${data.targetPassword}${accountDetails}`);
+      showToast("✅ 凭据已复制");
+    } catch {
+      showToast("❌ 浏览器不允许复制，请使用 API 读取凭据");
+    }
   };
 
   // ── Domain pools / forward rules (saved via saveConfig) ──
@@ -206,6 +285,55 @@ export default function AdminPage() {
           <div className="card text-center"><div className="text-3xl font-bold" style={{ color: "var(--primary)" }}>{stats.todayEmails}</div><div className="text-sm text-gray-500 mt-1">今日邮件</div></div>
         </div>
 
+        {/* Domain import requests */}
+        <div className="card mb-6">
+          <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--primary)" }}>📥 域名接入申请</h2>
+          <p className="text-sm text-gray-500 mb-2">提交注册商 API 信息和目标账号后，凭据会加密保存。邮件通知只发送摘要，不包含 API Key、Secret 或密码。</p>
+          <p className="text-sm text-gray-500 mb-4">Spaceship API Key 和 Secret 可在 <a href="https://www.spaceship.com/zh/application/api-manager/" target="_blank" rel="noreferrer" className="text-blue-500 hover:text-blue-700 underline">API Manager</a> 创建或查看。</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            <input type="text" placeholder="注册商，如 spaceship" value={irRegistrar} onChange={e => setIrRegistrar(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="text" placeholder="提交人/备注名" value={irRequestedBy} onChange={e => setIrRequestedBy(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="password" placeholder="API Key" value={irApiKey} onChange={e => setIrApiKey(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="password" placeholder="API Secret" value={irApiSecret} onChange={e => setIrApiSecret(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="text" placeholder="单账号用户名（简单场景）" value={irTargetUsername} onChange={e => setIrTargetUsername(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+            <input type="password" placeholder="单账号密码（简单场景）" value={irTargetPassword} onChange={e => setIrTargetPassword(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px" }} />
+          </div>
+          <textarea placeholder={"多账号接入明细，可填写多个用户名/密码/域名分配要求；会加密保存，不会出现在通知邮件里。示例：\nuser_a / password / 10 domains\nuser_b / password / example.com, example.net"} value={irTargetAccountsText} onChange={e => setIrTargetAccountsText(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 110 }} />
+          <textarea placeholder="域名清单，可留空；支持换行、空格或逗号分隔" value={irDomainsText} onChange={e => setIrDomainsText(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 90 }} />
+          <textarea placeholder="处理要求/备注（不要在这里写密码；密码请放在上方多账号明细）" value={irNotes} onChange={e => setIrNotes(e.target.value)} className="email-input mb-3" style={{ textAlign: "left", fontSize: "14px", minHeight: 70 }} />
+          <button onClick={submitImportRequest} className="px-6 py-2 rounded-lg font-medium text-white text-sm" style={{ background: "var(--primary)" }}>提交接入申请</button>
+
+          <div className="space-y-2 mt-4">
+            {importRequests.length === 0 && <p className="text-gray-400 text-sm py-2">暂无申请</p>}
+            {importRequests.map(r => (
+              <div key={r.id} className="bg-gray-50 rounded-lg px-4 py-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div>
+                    <span className="font-mono text-sm font-semibold">{r.targetUsername}</span>
+                    <span className="text-xs text-gray-400 ml-2">{r.registrar} · {r.domainCount || "未知"} 个域名 · key尾号 {r.apiKeyTail || "n/a"}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <select value={r.status} onChange={e => setImportRequestStatus(r.id, e.target.value)} className="text-xs border rounded px-2 py-1" style={{ borderColor: "#e0e0e0" }}>
+                      <option value="pending">pending</option>
+                      <option value="approved">approved</option>
+                      <option value="rejected">rejected</option>
+                      <option value="processing">processing</option>
+                      <option value="done">done</option>
+                    </select>
+                    {["approved", "processing"].includes(r.status) && (
+                      <button onClick={() => copyImportRequestCredentials(r.id)} className="text-xs text-blue-500 hover:text-blue-700">复制凭据</button>
+                    )}
+                  </div>
+                </div>
+                <div className="text-xs text-gray-500 mt-2">
+                  通知：{r.notificationSent ? "已发送" : (r.notificationError || "未配置")} · 提交人：{r.requestedBy || "未填写"}
+                </div>
+                {r.notes && <div className="text-xs text-gray-500 mt-1 whitespace-pre-wrap">{r.notes}</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+
         {/* Users */}
         <div className="card mb-6">
           <h2 className="text-lg font-semibold mb-4" style={{ color: "var(--primary)" }}>👥 用户管理</h2>
@@ -234,9 +362,9 @@ export default function AdminPage() {
           <div className="flex gap-2 flex-wrap items-end">
             <input type="text" placeholder="用户名" value={nuName} onChange={e => setNuName(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px", flex: "1 1 120px", minWidth: 100 }} />
             <input type="text" placeholder="初始密码" value={nuPass} onChange={e => setNuPass(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px", flex: "1 1 120px", minWidth: 100 }} />
-            <label className="text-xs text-gray-500">时<input type="number" min={1} value={nuHourly} onChange={e => setNuHourly(parseInt(e.target.value) || 1)} className="email-input" style={{ textAlign: "left", fontSize: "14px", width: 60 }} /></label>
-            <label className="text-xs text-gray-500">日<input type="number" min={1} value={nuDaily} onChange={e => setNuDaily(parseInt(e.target.value) || 1)} className="email-input" style={{ textAlign: "left", fontSize: "14px", width: 60 }} /></label>
-            <label className="text-xs text-gray-500">终身<input type="number" min={1} value={nuLifetime} onChange={e => setNuLifetime(parseInt(e.target.value) || 1)} className="email-input" style={{ textAlign: "left", fontSize: "14px", width: 70 }} /></label>
+            <label className="text-xs text-gray-500 flex items-center gap-1">时<input type="number" min={1} value={nuHourly} onChange={e => setNuHourly(parseInt(e.target.value) || 1)} className="email-input" style={{ fontSize: "14px", width: 88 }} /></label>
+            <label className="text-xs text-gray-500 flex items-center gap-1">日<input type="number" min={1} value={nuDaily} onChange={e => setNuDaily(parseInt(e.target.value) || 1)} className="email-input" style={{ fontSize: "14px", width: 88 }} /></label>
+            <label className="text-xs text-gray-500 flex items-center gap-1">终身<input type="number" min={1} value={nuLifetime} onChange={e => setNuLifetime(parseInt(e.target.value) || 1)} className="email-input" style={{ fontSize: "14px", width: 104 }} /></label>
             <button onClick={createUser} className="px-6 py-2 rounded-lg font-medium text-white text-sm" style={{ background: "var(--primary)" }}>创建用户</button>
           </div>
         </div>

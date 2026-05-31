@@ -1,8 +1,8 @@
 # 云端接码 — 自托管临时邮箱
 
-一个完全免费、可自托管的临时邮箱服务。用户可以随机生成邮箱地址，实时接收验证邮件，自动提取验证码和激活链接。
+一个完全免费、可自托管的临时邮箱服务。用户可以随机生成邮箱地址，实时接收验证邮件，自动提取验证码和激活链接。支持多用户/多租户：管理员创建用户并按域名独占分配，每个用户只看到自己域名下的邮件。
 
-**技术栈**：Next.js 前端 + Cloudflare Workers 后端 + Cloudflare D1 数据库
+**技术栈**：Next.js 16（前端）+ Cloudflare Workers（后端）+ Cloudflare D1（数据库）
 
 **托管费用**：全部使用免费套餐，零成本运行。
 
@@ -33,12 +33,15 @@
 - **随机生成临时邮箱** — 一键生成随机用户名，选择域名，即得一个可用邮箱地址
 - **实时收信** — 轮询刷新，邮件几秒内可见
 - **自动提取链接/验证码** — 正则匹配邮件正文，提取激活链接和验证码，一键复制
+- **多用户 / 多租户** — 管理员创建登录用户，并把域名**独占分配**给某个用户；用户登录后只能看到自己名下域名收到的邮件，互不可见
+- **按域名配额** — 每个用户可为自己的每个域名设置每日 / 每小时 / 累计生成上限，并随时启用或停用某个域名
 - **密码管理器** — 记录每个临时邮箱生成的密码，管理账号池
 - **标签分组（Tag）** — 给邮箱打标签，批量管理同类账号
 - **转发规则** — 指定子域名的来信自动转发到你的真实邮箱
-- **管理员面板** — 在线管理域名列表、转发规则、自动清理周期、站点密码等
+- **管理员面板** — 在线管理用户、域名分配、全局域名列表、转发规则、自动清理周期、站点密码等
 - **访问密码** — 可为网站设置访问密码，防止陌生人使用
 - **自动清理** — 定时删除过期邮件，避免数据库膨胀
+- **Hermes 机器对机器集成（可选）** — 通过共享密钥的专用接口，供自动化程序按用户领取地址、拉取激活链接
 
 ---
 
@@ -54,9 +57,12 @@ Next.js 前端（Vercel）
 Cloudflare Worker（后端 API）
     │
     ├── Cloudflare D1（SQLite 数据库）
-    │     ├── emails 表（收到的邮件）
-    │     ├── passwords 表（账号密码记录）
-    │     └── config 表（站点配置）
+    │     ├── emails 表（收到的邮件，含 owner_id 归属）
+    │     ├── passwords 表（账号密码记录，含 owner_id 归属）
+    │     ├── config 表（站点配置）
+    │     ├── users 表（登录用户 + 每域名配额）
+    │     ├── domain_owner 表（域名独占归属）
+    │     └── sessions 表（用户登录会话）
     │
     └── Cloudflare Email Routing
           └── 收到发往你域名的邮件 → 触发 Worker → 写入 D1
@@ -80,7 +86,7 @@ Cloudflare Worker（后端 API）
 2. **Cloudflare 账号**（免费）— [注册地址](https://dash.cloudflare.com/sign-up)
 3. **Vercel 账号**（免费）— [注册地址](https://vercel.com)
 4. **GitHub 账号**（免费）— 用于连接 Vercel 自动部署
-5. **本地安装 Node.js 18+** — [下载地址](https://nodejs.org)（安装后在终端运行 `node -v` 确认版本）
+5. **本地安装 Node.js 20+** — [下载地址](https://nodejs.org)（Next.js 16 要求 Node 20.9 及以上；安装后在终端运行 `node -v` 确认版本）
 
 ---
 
@@ -154,9 +160,16 @@ database_id = "上一步复制的 database_id"  # ← 粘贴到这里
 [vars]
 # 允许跨域的前端地址（先填占位符，部署完 Vercel 后回来改）
 ALLOWED_ORIGINS = "http://localhost:3000"
-# 管理员密码（自己设一个强密码）
+# 管理员密码（自己设一个强密码）。管理员凭此密码登录 /admin 管理用户和域名分配
 ADMIN_PASSWORD = "你的管理员密码"
+
+# ── 以下为 Hermes 机器对机器集成的可选项，不用自动化对接可全部省略 ──
+# HERMES_SHARED_SECRET = "调用方与 Worker 之间的共享密钥"
+# HERMES_USERNAME      = "自动化流程归属的用户名（默认 hermes）"
+# HERMES_LINK_MATCH    = "激活链接前缀白名单，逗号分隔，按前缀匹配"
 ```
+
+> **安全建议**：`ADMIN_PASSWORD`、`HERMES_SHARED_SECRET` 等敏感值更推荐用 `npx wrangler secret put <NAME>` 存为 Secret，而不是明文写进 `wrangler.toml` 提交到仓库。
 
 > **如何找到 Cloudflare 账号 ID**：登录 [Cloudflare Dashboard](https://dash.cloudflare.com)，点击右上角头像 → "My Profile"，或在任意域名页面右侧栏找到 "Account ID"。
 
@@ -166,7 +179,15 @@ ADMIN_PASSWORD = "你的管理员密码"
 npm run db:init
 ```
 
-这会在 D1 中创建 `emails`、`passwords`、`config` 三张表。
+这会在 D1 中创建全部数据表：`emails`、`passwords`、`config`、`users`、`domain_owner`、`sessions`。
+
+> **升级已有部署**：`schema.sql` 用的是 `CREATE TABLE IF NOT EXISTS`，对老库重复执行是安全的；新增列 / 索引等变更放在 `worker/migrations/` 下，按文件名日期顺序逐个执行，例如：
+>
+> ```bash
+> npx wrangler d1 execute temp-mail-db --remote --file=./migrations/2026-05-29_multiuser.sql
+> ```
+>
+> 多用户相关的 `users` / `domain_owner` / `sessions` 表及 `owner_id` 列即来自该迁移。
 
 #### 2.5 部署 Worker
 
@@ -285,6 +306,15 @@ npm run deploy
 
 回到首页，即可正常使用临时邮箱。
 
+#### 多用户与域名分配（可选）
+
+如果要把不同域名分给不同用户独立使用，在管理员面板的 **用户管理** 中：
+
+1. **创建用户**：填用户名 + 初始密码（用户名会统一按小写、去空格归一化保存）
+2. **分配域名**：把某个已配置的域名独占分配给该用户——一个域名同一时间只能属于一个用户；分配时该域名下已有的邮箱和邮件会自动归属到新用户
+3. 用户用自己的用户名 / 密码在首页登录后，只能看到自己名下域名收到的邮件，并可为每个域名设置每日 / 每小时 / 累计配额、启用或停用域名
+4. 管理员还可重置用户密码、删除用户（删除会释放其域名并把其数据置为无归属）
+
 ---
 
 ## （可选）Landing Worker
@@ -367,8 +397,9 @@ temp-mail/
 │       ├── admin/            # 管理员面板
 │       └── globals.css
 ├── worker/
-│   ├── src/index.ts          # 核心 Worker：收信 + API
-│   ├── schema.sql            # D1 数据库建表语句
+│   ├── src/index.ts          # 核心 Worker：收信 + API（含登录 / 多用户 / Hermes 端点）
+│   ├── schema.sql            # D1 建表语句（emails/passwords/config/users/domain_owner/sessions）
+│   ├── migrations/           # 增量迁移脚本（按日期顺序执行）
 │   ├── wrangler.toml         # Worker 配置（需修改）
 │   └── package.json
 ├── landing-worker/           # 可选：收信域名落地页

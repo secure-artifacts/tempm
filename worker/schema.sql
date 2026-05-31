@@ -73,5 +73,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at INTEGER NOT NULL
 );
 
+-- Activation links pushed for a profile (Hermes m2m flow + /api/activation-link).
+-- profile_id is the automation profile/token; consumed gates one-time pickup.
+CREATE TABLE IF NOT EXISTS activation_links (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  consumed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_activation_links_profile ON activation_links(profile_id, consumed, created_at);
+
 -- Auto cleanup: delete emails older than configured hours
 -- This is done via a cron trigger in the worker

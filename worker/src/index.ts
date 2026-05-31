@@ -178,8 +178,12 @@ async function getDomainCounts(db: D1Database, domain: string): Promise<{ daily:
 
 // ========== Users / Sessions / Ownership ==========
 
+// 容错匹配：调用方已传入 trim().toLowerCase() 的归一化值。这里用 lower(trim(...))
+// 对存量行做同样归一，使绕过 API 灌库/旧版本写入的非归一 username 行也能被解析到，
+// 避免「admin 列表能看到、按 username 登录/改密/派域名却 404/401」的漂移。
+// users 表行数极小，放弃 username 索引走全表扫描的代价可忽略。
 async function getUserByUsername(db: D1Database, username: string): Promise<User | null> {
-  return await db.prepare("SELECT * FROM users WHERE username = ?").bind(username).first() as User | null;
+  return await db.prepare("SELECT * FROM users WHERE lower(trim(username)) = ?").bind(username).first() as User | null;
 }
 
 async function getUserById(db: D1Database, id: string): Promise<User | null> {

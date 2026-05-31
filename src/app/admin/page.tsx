@@ -362,9 +362,9 @@ export default function AdminPage() {
           <div className="flex gap-2 flex-wrap items-end">
             <input type="text" placeholder="用户名" value={nuName} onChange={e => setNuName(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px", flex: "1 1 120px", minWidth: 100 }} />
             <input type="text" placeholder="初始密码" value={nuPass} onChange={e => setNuPass(e.target.value)} className="email-input" style={{ textAlign: "left", fontSize: "14px", flex: "1 1 120px", minWidth: 100 }} />
-            <label className="text-xs text-gray-500">时<input type="number" min={1} value={nuHourly} onChange={e => setNuHourly(parseInt(e.target.value) || 1)} className="email-input" style={{ textAlign: "left", fontSize: "14px", width: 60 }} /></label>
-            <label className="text-xs text-gray-500">日<input type="number" min={1} value={nuDaily} onChange={e => setNuDaily(parseInt(e.target.value) || 1)} className="email-input" style={{ textAlign: "left", fontSize: "14px", width: 60 }} /></label>
-            <label className="text-xs text-gray-500">终身<input type="number" min={1} value={nuLifetime} onChange={e => setNuLifetime(parseInt(e.target.value) || 1)} className="email-input" style={{ textAlign: "left", fontSize: "14px", width: 70 }} /></label>
+            <label className="text-xs text-gray-500 flex items-center gap-1">时<input type="number" min={1} value={nuHourly} onChange={e => setNuHourly(parseInt(e.target.value) || 1)} className="email-input" style={{ fontSize: "14px", width: 88 }} /></label>
+            <label className="text-xs text-gray-500 flex items-center gap-1">日<input type="number" min={1} value={nuDaily} onChange={e => setNuDaily(parseInt(e.target.value) || 1)} className="email-input" style={{ fontSize: "14px", width: 88 }} /></label>
+            <label className="text-xs text-gray-500 flex items-center gap-1">终身<input type="number" min={1} value={nuLifetime} onChange={e => setNuLifetime(parseInt(e.target.value) || 1)} className="email-input" style={{ fontSize: "14px", width: 104 }} /></label>
             <button onClick={createUser} className="px-6 py-2 rounded-lg font-medium text-white text-sm" style={{ background: "var(--primary)" }}>创建用户</button>
           </div>
         </div>

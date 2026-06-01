@@ -44,6 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_passwords_label_confirmed_created ON passwords(la
 CREATE INDEX IF NOT EXISTS idx_passwords_confirmed_updated ON passwords(confirmed, updated_at);
 CREATE INDEX IF NOT EXISTS idx_passwords_confirmed_created ON passwords(confirmed, created_at);
 CREATE INDEX IF NOT EXISTS idx_passwords_domain_confirmed_created ON passwords(domain, confirmed, created_at);
+CREATE INDEX IF NOT EXISTS idx_passwords_domain_link_received ON passwords(domain, last_link_received_at);
 
 -- Multi-user multi-tenant tables (see migrations/2026-05-29_multiuser.sql)
 CREATE TABLE IF NOT EXISTS users (
@@ -51,9 +52,9 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   is_admin INTEGER NOT NULL DEFAULT 0,
-  daily_limit INTEGER NOT NULL DEFAULT 20,
-  hourly_limit INTEGER NOT NULL DEFAULT 5,
-  lifetime_limit INTEGER NOT NULL DEFAULT 500,
+  daily_limit INTEGER NOT NULL DEFAULT 5,
+  hourly_limit INTEGER NOT NULL DEFAULT 2,
+  lifetime_limit INTEGER NOT NULL DEFAULT 50,
   created_at INTEGER NOT NULL
 );
 

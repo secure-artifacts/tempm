@@ -65,9 +65,9 @@ export default function AdminPage() {
   // New user inputs
   const [nuName, setNuName] = useState("");
   const [nuPass, setNuPass] = useState("");
-  const [nuDaily, setNuDaily] = useState(20);
-  const [nuHourly, setNuHourly] = useState(5);
-  const [nuLifetime, setNuLifetime] = useState(500);
+  const [nuDaily, setNuDaily] = useState(5);
+  const [nuHourly, setNuHourly] = useState(2);
+  const [nuLifetime, setNuLifetime] = useState(50);
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 2500); };
   const authHeaders = useCallback(() => ({ "Content-Type": "application/json", Authorization: `Bearer ${token}` }), [token]);
@@ -226,6 +226,18 @@ export default function AdminPage() {
     const res = await fetch(`${WORKER_URL}/api/admin/users/password`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ username, newPassword: np }) });
     showToast(res.ok ? "✅ 密码已重置" : "❌ 重置失败");
   };
+  const editUserQuota = async (u: AdminUser) => {
+    const raw = prompt(`修改 ${u.username} 的配额，格式：每小时,每日,终身`, `${u.hourlyLimit},${u.dailyLimit},${u.lifetimeLimit}`);
+    if (!raw) return;
+    const [hourlyLimit, dailyLimit, lifetimeLimit] = raw.split(",").map(v => parseInt(v.trim()));
+    if (!hourlyLimit || !dailyLimit || !lifetimeLimit) { showToast("⚠️ 格式应为：2,5,50"); return; }
+    const res = await fetch(`${WORKER_URL}/api/admin/users/quota`, {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ username: u.username, hourlyLimit, dailyLimit, lifetimeLimit }),
+    });
+    if (res.ok) { showToast("✅ 配额已更新"); loadUsers(); }
+    else showToast("❌ " + ((await res.json()).error || "更新失败"));
+  };
   const deleteUser = async (username: string) => {
     if (!confirm(`确定删除用户 ${username}？其域名将被释放，名下邮件归属清空。`)) return;
     const res = await fetch(`${WORKER_URL}/api/admin/users`, { method: "DELETE", headers: authHeaders(), body: JSON.stringify({ username }) });
@@ -348,6 +360,7 @@ export default function AdminPage() {
                   </div>
                   <div className="flex gap-2">
                     <button onClick={() => resetUserPw(u.username)} className="text-xs text-blue-500 hover:text-blue-700">重置密码</button>
+                    <button onClick={() => editUserQuota(u)} className="text-xs text-green-600 hover:text-green-800">改配额</button>
                     <button onClick={() => deleteUser(u.username)} className="text-xs text-red-400 hover:text-red-600">删除</button>
                   </div>
                 </div>

@@ -47,9 +47,9 @@ interface ImportRequestRow {
 type Actor = { isAdmin: boolean; user: User | null };
 
 // Defaults for newly created users (per-domain quotas).
-const DEFAULT_DAILY_LIMIT = 20;
-const DEFAULT_HOURLY_LIMIT = 5;
-const DEFAULT_LIFETIME_LIMIT = 500;
+const DEFAULT_DAILY_LIMIT = 5;
+const DEFAULT_HOURLY_LIMIT = 2;
+const DEFAULT_LIFETIME_LIMIT = 50;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const MAX_IMPORT_TEXT_CHARS = 20000;
 const MAX_IMPORT_NOTES_CHARS = 2000;
@@ -263,26 +263,32 @@ async function getConfiguredDomains(db: D1Database): Promise<Set<string>> {
   ]);
 }
 
-// Lifetime count for a domain = confirmed (received-email) addresses ever. Since
-// domains are exclusively owned, this is also the owner's lifetime count for it.
+// Quota is consumed only by addresses that have received an activation link.
+// Ordinary mail and reserved-but-unused addresses do not count.
 async function getDomainLifetimeUsed(db: D1Database, domain: string): Promise<number> {
   const row = await db.prepare(
-    "SELECT COUNT(*) as count FROM passwords WHERE confirmed = 1 AND domain = ?"
+    "SELECT COUNT(*) as count FROM passwords WHERE last_link_received_at IS NOT NULL AND domain = ?"
   ).bind(domain).first() as { count: number } | null;
   return row?.count || 0;
 }
 
-// hourly (clock-hour), daily (since 23:30 ET reset), lifetime confirmed counts for a domain.
+// hourly (clock-hour), daily (since 23:30 ET reset), lifetime activation-link counts for a domain.
 async function getDomainCounts(db: D1Database, domain: string): Promise<{ daily: number; hourly: number; lifetime: number }> {
   const resetTs = getLastEasternReset();
   const hourStart = new Date();
   hourStart.setMinutes(0, 0, 0);
   const [d, h, l] = await Promise.all([
-    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE confirmed = 1 AND domain = ? AND created_at >= ?").bind(domain, resetTs).first() as Promise<{ c: number } | null>,
-    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE confirmed = 1 AND domain = ? AND created_at >= ?").bind(domain, hourStart.getTime()).first() as Promise<{ c: number } | null>,
-    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE confirmed = 1 AND domain = ?").bind(domain).first() as Promise<{ c: number } | null>,
+    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE last_link_received_at IS NOT NULL AND domain = ? AND last_link_received_at >= ?").bind(domain, resetTs).first() as Promise<{ c: number } | null>,
+    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE last_link_received_at IS NOT NULL AND domain = ? AND last_link_received_at >= ?").bind(domain, hourStart.getTime()).first() as Promise<{ c: number } | null>,
+    db.prepare("SELECT COUNT(*) as c FROM passwords WHERE last_link_received_at IS NOT NULL AND domain = ?").bind(domain).first() as Promise<{ c: number } | null>,
   ]);
   return { daily: d?.c || 0, hourly: h?.c || 0, lifetime: l?.c || 0 };
+}
+
+function domainWithinQuota(counts: { daily: number; hourly: number; lifetime: number }, user: Pick<User, "daily_limit" | "hourly_limit" | "lifetime_limit">): boolean {
+  return counts.hourly < user.hourly_limit &&
+    counts.daily < user.daily_limit &&
+    counts.lifetime < user.lifetime_limit;
 }
 
 // ========== Users / Sessions / Ownership ==========
@@ -458,14 +464,14 @@ async function generateAddressForOwner(
   const preferredDomains = enabledDomains.filter((d) => !usedDomains.has(d.toLowerCase()));
   const candidateDomains = preferredDomains.length > 0 ? preferredDomains : enabledDomains;
 
-  const lifetimeCounts = await Promise.all(
-    candidateDomains.map((d) => getDomainLifetimeUsed(db, d).then((used) => ({ domain: d, used })))
+  const quotaCounts = await Promise.all(
+    candidateDomains.map((d) => getDomainCounts(db, d).then((counts) => ({ domain: d, counts })))
   );
-  const eligibleDomains = lifetimeCounts
-    .filter(({ used }) => used < owner.lifetime_limit)
+  const eligibleDomains = quotaCounts
+    .filter(({ counts }) => domainWithinQuota(counts, owner))
     .map(({ domain }) => domain);
   if (!eligibleDomains.length) {
-    throw new Error("all owner domains have reached lifetime quota");
+    throw new Error("all owner domains have reached activation-link quota");
   }
 
   const generated: string[] = [];
@@ -943,6 +949,30 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
       return Response.json({ ok: true }, { headers });
     }
 
+    // POST /api/admin/users/quota — admin set a user's per-domain activation-link quotas
+    if (url.pathname === "/api/admin/users/quota" && request.method === "POST") {
+      const body = JSON.parse(await request.text()) as {
+        username?: string; dailyLimit?: number; hourlyLimit?: number; lifetimeLimit?: number;
+      };
+      const username = (body.username || "").trim().toLowerCase();
+      const user = username ? await getUserByUsername(env.DB, username) : null;
+      if (!user) return Response.json({ error: "用户不存在" }, { status: 404, headers });
+      const sets: string[] = [];
+      const binds: number[] = [];
+      for (const [key, col] of [["dailyLimit", "daily_limit"], ["hourlyLimit", "hourly_limit"], ["lifetimeLimit", "lifetime_limit"]] as const) {
+        const v = body[key];
+        if (v !== undefined) {
+          const n = parseInt(String(v));
+          if (!n || n < 1) return Response.json({ error: `${key} 必须 >= 1` }, { status: 400, headers });
+          sets.push(`${col} = ?`);
+          binds.push(n);
+        }
+      }
+      if (!sets.length) return Response.json({ error: "no quota fields provided" }, { status: 400, headers });
+      await env.DB.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, user.id).run();
+      return Response.json({ ok: true }, { headers });
+    }
+
     // GET /api/admin/import-requests — list domain import requests without secrets
     if (url.pathname === "/api/admin/import-requests" && request.method === "GET") {
       const rows = await env.DB.prepare(
@@ -1235,21 +1265,25 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 
     const ownerId = owner?.owner_id || null;
     const limitUser = actor.user ?? (ownerId ? await getUserById(env.DB, ownerId) : null);
-    const lifetimeLimit = limitUser?.lifetime_limit ?? DEFAULT_LIFETIME_LIMIT;
+    const quotaUser = limitUser ?? {
+      daily_limit: DEFAULT_DAILY_LIMIT,
+      hourly_limit: DEFAULT_HOURLY_LIMIT,
+      lifetime_limit: DEFAULT_LIFETIME_LIMIT,
+    };
 
-    const [existingPassword, existingEmail, lifetimeUsed] = await Promise.all([
+    const [existingPassword, existingEmail, quotaCounts] = await Promise.all([
       env.DB.prepare("SELECT address FROM passwords WHERE address = ? LIMIT 1").bind(address).first(),
       env.DB.prepare("SELECT mail_to FROM emails WHERE mail_to = ? LIMIT 1").bind(address).first(),
-      getDomainLifetimeUsed(env.DB, addrDomain),
+      getDomainCounts(env.DB, addrDomain),
     ]);
     if (existingPassword || existingEmail) {
       return Response.json({ error: "address already exists" }, { status: 409, headers });
     }
-    if (lifetimeUsed >= lifetimeLimit) {
-      return Response.json({ error: "domain lifetime quota exceeded" }, { status: 429, headers });
+    if (!domainWithinQuota(quotaCounts, quotaUser)) {
+      return Response.json({ error: "domain activation-link quota exceeded" }, { status: 429, headers });
     }
     const now = Date.now();
-    // Saved as unconfirmed; quota is consumed only when an email arrives (confirmed=1).
+    // Saved as unconfirmed; quota is consumed only when an activation link arrives.
     await env.DB.prepare(
       "INSERT INTO passwords (address, password, label, confirmed, created_at, updated_at, domain, owner_id) VALUES (?, ?, '', 0, ?, ?, ?, ?)"
     ).bind(address, body.password, now, now, addrDomain, ownerId).run();
@@ -1344,21 +1378,29 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const preferredDomains = allDomains.filter(d => !usedDomains.has(d));
     const candidateDomains = preferredDomains.length > 0 ? preferredDomains : allDomains;
 
-    // Per-domain lifetime limit = owner's limit if owned, else default.
+    // Per-domain quota = owner's limits if owned, else defaults.
     const ownerRows = await env.DB.prepare(
-      "SELECT do.domain as domain, do.owner_id as owner_id, u.lifetime_limit as lifetime_limit FROM domain_owner do JOIN users u ON u.id = do.owner_id"
+      "SELECT do.domain as domain, do.owner_id as owner_id, u.hourly_limit as hourly_limit, u.daily_limit as daily_limit, u.lifetime_limit as lifetime_limit FROM domain_owner do JOIN users u ON u.id = do.owner_id"
     ).all();
-    const ownerByDomain = new Map<string, { ownerId: string; lifetime: number }>();
-    for (const r of (ownerRows.results || []) as { domain: string; owner_id: string; lifetime_limit: number }[]) {
-      ownerByDomain.set(r.domain.toLowerCase(), { ownerId: r.owner_id, lifetime: r.lifetime_limit });
+    const ownerByDomain = new Map<string, { ownerId: string; hourly: number; daily: number; lifetime: number }>();
+    for (const r of (ownerRows.results || []) as { domain: string; owner_id: string; hourly_limit: number; daily_limit: number; lifetime_limit: number }[]) {
+      ownerByDomain.set(r.domain.toLowerCase(), { ownerId: r.owner_id, hourly: r.hourly_limit, daily: r.daily_limit, lifetime: r.lifetime_limit });
     }
-    const lifetimeCounts = await Promise.all(
-      candidateDomains.map(d => getDomainLifetimeUsed(env.DB, d).then(count => ({ d, count })))
+    const quotaCounts = await Promise.all(
+      candidateDomains.map(d => getDomainCounts(env.DB, d).then(counts => ({ d, counts })))
     );
-    const domains = lifetimeCounts
-      .filter(({ d, count }) => count < (ownerByDomain.get(d.toLowerCase())?.lifetime ?? DEFAULT_LIFETIME_LIMIT))
+    const domains = quotaCounts
+      .filter(({ d, counts }) => {
+        const ownerConfig = ownerByDomain.get(d.toLowerCase());
+        const quotaUser = {
+          hourly_limit: ownerConfig?.hourly ?? DEFAULT_HOURLY_LIMIT,
+          daily_limit: ownerConfig?.daily ?? DEFAULT_DAILY_LIMIT,
+          lifetime_limit: ownerConfig?.lifetime ?? DEFAULT_LIFETIME_LIMIT,
+        };
+        return domainWithinQuota(counts, quotaUser);
+      })
       .map(({ d }) => d);
-    if (!domains.length) return Response.json({ error: "all domains have reached lifetime quota" }, { status: 429, headers });
+    if (!domains.length) return Response.json({ error: "all domains have reached activation-link quota" }, { status: 429, headers });
 
     let address = "";
     let chosenDomain = "";
@@ -1557,8 +1599,8 @@ export default {
     // Only mailboxes we generated (pre-registered) receive mail. Tags are retired,
     // so there is no auto-create path for arbitrary catch-all addresses.
     const preRegistered = await env.DB.prepare(
-      "SELECT address, confirmed, owner_id FROM passwords WHERE address = ?"
-    ).bind(to).first() as { address: string; confirmed: number; owner_id: string | null } | null;
+      "SELECT address, confirmed, owner_id, last_link_received_at FROM passwords WHERE address = ?"
+    ).bind(to).first() as { address: string; confirmed: number; owner_id: string | null; last_link_received_at: number | null } | null;
     if (!preRegistered) return;
 
     const ownerRow = await getDomainOwner(env.DB, domain);
@@ -1568,16 +1610,22 @@ export default {
     const rawEmail = await streamToText(message.raw);
     const { subject, textBody, htmlBody } = parseEmailContent(rawEmail);
     const now = Date.now();
+    const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
+    const uiLink = extractActivationLink(htmlBody, textBody, linkFilter);
+    const hermesLink = extractFirstMatchingLink(htmlBody, textBody, getHermesLinkMatches(env));
+    const hasActivationLink = !!(uiLink || hermesLink);
+    const isFirstActivationLink = hasActivationLink && !preRegistered.last_link_received_at;
+
+    if (owner && isFirstActivationLink) {
+      const c = await getDomainCounts(env.DB, domain);
+      if (!domainWithinQuota(c, owner)) {
+        return; // quota full → drop silently (no quota consumed, no email stored)
+      }
+    }
 
     if (!preRegistered.confirmed) {
-      // First email confirms the mailbox. Quota is enforced here (per the owner's
-      // limits) — hourly + daily + lifetime, all counted on confirmed=1 addresses.
-      if (owner) {
-        const c = await getDomainCounts(env.DB, domain);
-        if (c.hourly >= owner.hourly_limit || c.daily >= owner.daily_limit || c.lifetime >= owner.lifetime_limit) {
-          return; // quota full → drop silently (no quota consumed, no email stored)
-        }
-      }
+      // First email confirms the mailbox, but quota is consumed only by the
+      // first activation link receipt.
       await env.DB.prepare(
         "UPDATE passwords SET confirmed = 1, owner_id = ?, updated_at = ? WHERE address = ?"
       ).bind(ownerId, now, to).run();
@@ -1594,10 +1642,7 @@ export default {
     ).bind(generateId(), to, message.from, subject, textBody, htmlBody, now, ownerId).run();
 
     // Record activation-link receipt + push to profile automation if applicable
-    const linkFilter = (await getConfig(env.DB, "link_filter")) || "auth.heygen.com";
-    const uiLink = extractActivationLink(htmlBody, textBody, linkFilter);
-    const hermesLink = extractFirstMatchingLink(htmlBody, textBody, getHermesLinkMatches(env));
-    if (uiLink || hermesLink) {
+    if (isFirstActivationLink) {
       await env.DB.prepare(
         "UPDATE passwords SET last_link_received_at = ? WHERE address = ?"
       ).bind(now, to).run();

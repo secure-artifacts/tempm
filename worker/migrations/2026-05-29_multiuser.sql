@@ -10,9 +10,9 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   is_admin INTEGER NOT NULL DEFAULT 0,
-  daily_limit INTEGER NOT NULL DEFAULT 20,
-  hourly_limit INTEGER NOT NULL DEFAULT 5,
-  lifetime_limit INTEGER NOT NULL DEFAULT 500,
+  daily_limit INTEGER NOT NULL DEFAULT 5,
+  hourly_limit INTEGER NOT NULL DEFAULT 2,
+  lifetime_limit INTEGER NOT NULL DEFAULT 50,
   created_at INTEGER NOT NULL
 );
 

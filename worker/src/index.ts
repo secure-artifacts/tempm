@@ -1647,19 +1647,23 @@ export default {
         "UPDATE passwords SET last_link_received_at = ? WHERE address = ?"
       ).bind(now, to).run();
 
-      const profileRow = await env.DB.prepare(
-        "SELECT profile_id FROM profile_addresses WHERE address = ?"
-      ).bind(to).first() as { profile_id: string } | null;
-      if (profileRow && hermesLink) {
-        const existing = await env.DB.prepare(
-          "SELECT id FROM activation_links WHERE profile_id = ? AND url = ? AND consumed = 0 LIMIT 1"
-        ).bind(profileRow.profile_id, hermesLink).first();
-        if (!existing) {
-        await env.DB.prepare(
-          "INSERT INTO activation_links (id, profile_id, url, created_at, consumed) VALUES (?, ?, ?, ?, 0)"
-        ).bind(generateId(), profileRow.profile_id, hermesLink, now).run();
+      // Profile automation is optional. Do not let a schema drift or queue
+      // failure here make Cloudflare retry an already-persisted inbound email.
+      try {
+        const profileRow = await env.DB.prepare(
+          "SELECT profile_id FROM profile_addresses WHERE address = ?"
+        ).bind(to).first() as { profile_id: string } | null;
+        if (profileRow && hermesLink) {
+          const existing = await env.DB.prepare(
+            "SELECT id FROM activation_links WHERE profile_id = ? AND url = ? AND consumed = 0 LIMIT 1"
+          ).bind(profileRow.profile_id, hermesLink).first();
+          if (!existing) {
+            await env.DB.prepare(
+              "INSERT INTO activation_links (id, profile_id, url, created_at, consumed) VALUES (?, ?, ?, ?, 0)"
+            ).bind(generateId(), profileRow.profile_id, hermesLink, now).run();
+          }
         }
-      }
+      } catch {}
     }
   },
 

@@ -43,6 +43,12 @@ interface ImportRequestRow {
   updated_at: number;
 }
 
+type QuotaUpdateBody = {
+  dailyLimit?: unknown;
+  hourlyLimit?: unknown;
+  lifetimeLimit?: unknown;
+};
+
 // Resolved request actor: admin (ADMIN_PASSWORD bearer) or a logged-in user.
 type Actor = { isAdmin: boolean; user: User | null };
 
@@ -338,6 +344,21 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
 function checkAuth(request: Request, env: Env): boolean {
   const auth = request.headers.get("Authorization") || "";
   return auth === `Bearer ${env.ADMIN_PASSWORD}`;
+}
+
+function collectQuotaUpdates(body: QuotaUpdateBody): { sets: string[]; binds: number[]; error?: string } {
+  const sets: string[] = [];
+  const binds: number[] = [];
+  for (const [key, col] of [["dailyLimit", "daily_limit"], ["hourlyLimit", "hourly_limit"], ["lifetimeLimit", "lifetime_limit"]] as const) {
+    const v = body[key];
+    if (v !== undefined) {
+      const n = parseInt(String(v), 10);
+      if (!Number.isFinite(n) || n < 1) return { sets, binds, error: `${key} 必须 >= 1` };
+      sets.push(`${col} = ?`);
+      binds.push(n);
+    }
+  }
+  return { sets, binds };
 }
 
 function checkHermesAuth(request: Request, env: Env): boolean {
@@ -804,18 +825,9 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/account/quota" && request.method === "POST") {
     const actor = await resolveActor(request, env);
     if (!actor || !actor.user) return Response.json({ error: "unauthorized" }, { status: 401, headers });
-    const body = JSON.parse(await request.text()) as { dailyLimit?: number; hourlyLimit?: number; lifetimeLimit?: number };
-    const sets: string[] = [];
-    const binds: number[] = [];
-    for (const [key, col] of [["dailyLimit", "daily_limit"], ["hourlyLimit", "hourly_limit"], ["lifetimeLimit", "lifetime_limit"]] as const) {
-      const v = body[key];
-      if (v !== undefined) {
-        const n = parseInt(String(v));
-        if (!n || n < 1) return Response.json({ error: `${key} 必须 >= 1` }, { status: 400, headers });
-        sets.push(`${col} = ?`);
-        binds.push(n);
-      }
-    }
+    const body = JSON.parse(await request.text()) as QuotaUpdateBody;
+    const { sets, binds, error } = collectQuotaUpdates(body);
+    if (error) return Response.json({ error }, { status: 400, headers });
     if (sets.length) {
       await env.DB.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, actor.user.id).run();
     }
@@ -951,24 +963,18 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 
     // POST /api/admin/users/quota — admin set a user's per-domain activation-link quotas
     if (url.pathname === "/api/admin/users/quota" && request.method === "POST") {
-      const body = JSON.parse(await request.text()) as {
-        username?: string; dailyLimit?: number; hourlyLimit?: number; lifetimeLimit?: number;
-      };
+      const body = JSON.parse(await request.text()) as QuotaUpdateBody & { username?: string };
       const username = (body.username || "").trim().toLowerCase();
+      if (!username) {
+        return Response.json({ error: "username required" }, { status: 400, headers });
+      }
       const user = username ? await getUserByUsername(env.DB, username) : null;
       if (!user) return Response.json({ error: "用户不存在" }, { status: 404, headers });
-      const sets: string[] = [];
-      const binds: number[] = [];
-      for (const [key, col] of [["dailyLimit", "daily_limit"], ["hourlyLimit", "hourly_limit"], ["lifetimeLimit", "lifetime_limit"]] as const) {
-        const v = body[key];
-        if (v !== undefined) {
-          const n = parseInt(String(v));
-          if (!n || n < 1) return Response.json({ error: `${key} 必须 >= 1` }, { status: 400, headers });
-          sets.push(`${col} = ?`);
-          binds.push(n);
-        }
+      const { sets, binds, error } = collectQuotaUpdates(body);
+      if (error) return Response.json({ error }, { status: 400, headers });
+      if (!sets.length) {
+        return Response.json({ error: "至少设置一个配额" }, { status: 400, headers });
       }
-      if (!sets.length) return Response.json({ error: "no quota fields provided" }, { status: 400, headers });
       await env.DB.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, user.id).run();
       return Response.json({ ok: true }, { headers });
     }

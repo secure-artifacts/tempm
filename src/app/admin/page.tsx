@@ -226,14 +226,18 @@ export default function AdminPage() {
     const res = await fetch(`${WORKER_URL}/api/admin/users/password`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ username, newPassword: np }) });
     showToast(res.ok ? "✅ 密码已重置" : "❌ 重置失败");
   };
-  const editUserQuota = async (u: AdminUser) => {
-    const raw = prompt(`修改 ${u.username} 的配额，格式：每小时,每日,终身`, `${u.hourlyLimit},${u.dailyLimit},${u.lifetimeLimit}`);
+  const editUserQuota = async (user: AdminUser) => {
+    const raw = prompt(`修改 ${user.username} 激活链接配额（格式：每小时,每天,终身）`, `${user.hourlyLimit},${user.dailyLimit},${user.lifetimeLimit}`);
     if (!raw) return;
-    const [hourlyLimit, dailyLimit, lifetimeLimit] = raw.split(",").map(v => parseInt(v.trim()));
-    if (!hourlyLimit || !dailyLimit || !lifetimeLimit) { showToast("⚠️ 格式应为：2,5,50"); return; }
+    const parts = raw.split(/[，,]/).map(v => parseInt(v.trim(), 10));
+    if (parts.length !== 3 || parts.some(v => !Number.isFinite(v) || v < 1)) {
+      showToast("⚠️ 请输入格式：每小时,每天,终身");
+      return;
+    }
+    const [hourlyLimit, dailyLimit, lifetimeLimit] = parts;
     const res = await fetch(`${WORKER_URL}/api/admin/users/quota`, {
       method: "POST", headers: authHeaders(),
-      body: JSON.stringify({ username: u.username, hourlyLimit, dailyLimit, lifetimeLimit }),
+      body: JSON.stringify({ username: user.username, hourlyLimit, dailyLimit, lifetimeLimit }),
     });
     if (res.ok) { showToast("✅ 配额已更新"); loadUsers(); }
     else showToast("❌ " + ((await res.json()).error || "更新失败"));
@@ -349,6 +353,7 @@ export default function AdminPage() {
         {/* Users */}
         <div className="card mb-6">
           <h2 className="text-lg font-semibold mb-4" style={{ color: "var(--primary)" }}>👥 用户管理</h2>
+          <p className="text-xs text-gray-400 mb-3">配额按每个域名收到激活链接的邮箱计数，普通邮件不计入。</p>
           <div className="space-y-2 mb-4">
             {users.length === 0 && <p className="text-gray-400 text-sm py-2">还没有用户</p>}
             {users.map(u => (

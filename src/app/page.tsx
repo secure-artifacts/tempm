@@ -103,7 +103,7 @@ function SettingsModal({ token, account, onClose, onSaved }: { token: string; ac
               <input type="number" min={1} value={lifetime} onChange={e => setLifetime(parseInt(e.target.value) || 1)}
                 className="email-input mt-1" style={{ textAlign: "left", fontSize: "14px" }} /></label>
           </div>
-          <p className="text-xs text-gray-400 mt-1">以收到的激活邮件为准计数</p>
+          <p className="text-xs text-gray-400 mt-1">只按收到激活链接的邮箱计数，普通邮件不算</p>
           <button onClick={saveQuota} disabled={busy} className="btn-primary w-full mt-2 text-sm">保存配额</button>
         </div>
 

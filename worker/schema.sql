@@ -108,5 +108,14 @@ CREATE TABLE IF NOT EXISTS activation_links (
 
 CREATE INDEX IF NOT EXISTS idx_activation_links_profile ON activation_links(profile_id, consumed, created_at);
 
+-- Profile → generated address mapping used by Hermes and admin automation.
+CREATE TABLE IF NOT EXISTS profile_addresses (
+  address TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  assigned_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_profile_addresses_profile ON profile_addresses(profile_id, assigned_at);
+
 -- Auto cleanup: delete emails older than configured hours
 -- This is done via a cron trigger in the worker

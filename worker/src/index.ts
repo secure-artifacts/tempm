@@ -1663,7 +1663,9 @@ export default {
             ).bind(generateId(), profileRow.profile_id, hermesLink, now).run();
           }
         }
-      } catch {}
+      } catch (err) {
+        console.error("profile activation-link queue failed", to, err);
+      }
     }
   },
 

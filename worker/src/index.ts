@@ -190,6 +190,29 @@ async function sendImportRequestNotification(env: Env, request: {
   return { sent: true };
 }
 
+// Idempotent bootstrap for tables added after the original schema.sql.
+// Existing D1 databases converge on their own instead of requiring an
+// out-of-band `wrangler d1 execute` run against production.
+let schemaBootstrap: Promise<void> | null = null;
+
+function ensureSchema(env: Env): Promise<void> {
+  if (!schemaBootstrap) {
+    schemaBootstrap = (async () => {
+      await env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS profile_addresses (address TEXT PRIMARY KEY, profile_id TEXT NOT NULL, assigned_at INTEGER NOT NULL)"
+      ).run();
+      await env.DB.prepare(
+        "CREATE INDEX IF NOT EXISTS idx_profile_addresses_profile ON profile_addresses(profile_id, assigned_at)"
+      ).run();
+    })().catch((err) => {
+      // Let a later invocation retry rather than caching the failure forever.
+      schemaBootstrap = null;
+      throw err;
+    });
+  }
+  return schemaBootstrap;
+}
+
 function corsHeaders(request: Request, env: Env): Record<string, string> {
   const origin = request.headers.get("Origin") || "";
   const allowed = (env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim());
@@ -1656,6 +1679,7 @@ export default {
       // Profile automation is optional. Do not let a schema drift or queue
       // failure here make Cloudflare retry an already-persisted inbound email.
       try {
+        await ensureSchema(env);
         const profileRow = await env.DB.prepare(
           "SELECT profile_id FROM profile_addresses WHERE address = ?"
         ).bind(to).first() as { profile_id: string } | null;
@@ -1677,6 +1701,7 @@ export default {
 
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
+      await ensureSchema(env);
       return await handleFetch(request, env);
     } catch (err) {
       const headers = corsHeaders(request, env);
